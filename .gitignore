@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+bbs.db
+weather_cache.json
+.env
+*.log
