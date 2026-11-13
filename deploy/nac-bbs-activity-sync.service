@@ -1,0 +1,12 @@
+[Unit]
+Description=NAC-BBS MeshCore activity sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=nac-bbs
+Group=nac-bbs
+WorkingDirectory=/home/nac-bbs/meshcore-bbs
+EnvironmentFile=/etc/nac-bbs/activity-sync.env
+ExecStart=/home/nac-bbs/meshcore-bbs/venv/bin/python /home/nac-bbs/meshcore-bbs/activity_sync.py
