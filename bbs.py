@@ -789,6 +789,25 @@ async def main():
 
     await meshcore.start_auto_message_fetching()
 
+    print(f"[{stamp()}] Sending NAC-BBS flood advertisement...")
+
+    advert_result = await meshcore.commands.send_advert(
+        flood=True,
+    )
+
+    if advert_result.type == EventType.ERROR:
+        print(
+            f"[{stamp()}] ERROR sending advertisement:"
+        )
+        print(advert_result.payload)
+    else:
+        print(
+            f"[{stamp()}] NAC-BBS flood advertisement sent."
+        )
+
+    print()
+    print(f"[{stamp()}] NAC-BBS is online.")
+
     print()
     print(f"[{stamp()}] NAC-BBS is online.")
     print(
