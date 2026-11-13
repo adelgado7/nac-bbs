@@ -1,7 +1,8 @@
 import asyncio
+import hashlib
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from meshcore import MeshCore, EventType
@@ -16,6 +17,13 @@ DEVICE = (
 BASE_DIR = Path.home() / "meshcore-bbs"
 DB_FILE = BASE_DIR / "bbs.db"
 WEATHER_CACHE = BASE_DIR / "weather_cache.json"
+
+# Courtesy advert behavior. When NAC-BBS hears a direct client advert,
+# it answers with one zero-hop advert so the client also learns NAC-BBS.
+# The per-client cooldown prevents advert ping-pong or repeated chatter.
+COURTESY_ADVERT_COOLDOWN_SECONDS = 30 * 60
+COURTESY_ADVERT_DELAY_SECONDS = 1.0
+MESHCORE_CLIENT_TYPE = 1
 
 
 def stamp():
@@ -79,6 +87,58 @@ def init_db():
         ON mail(recipient_key, read_at)
     """)
 
+    # Current MeshCore device roster. One row per public key.
+    # Mailbox identity remains private in the users table and is joined
+    # only when needed for local/admin reporting.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS devices (
+            public_key TEXT PRIMARY KEY,
+            public_id TEXT NOT NULL UNIQUE,
+            advertised_name TEXT,
+            node_type INTEGER,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            last_event_type TEXT NOT NULL,
+            last_snr REAL,
+            last_advert_path_len INTEGER,
+            sighting_count INTEGER NOT NULL DEFAULT 1
+        )
+    """)
+
+    # Append-only observation history. This is intentionally metadata
+    # only; message bodies are not copied into the sightings log.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sightings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            observed_at TEXT NOT NULL,
+            public_key TEXT NOT NULL,
+            public_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            advertised_name TEXT,
+            mailbox_name TEXT,
+            node_type INTEGER,
+            snr REAL,
+            advert_path_len INTEGER,
+            FOREIGN KEY (public_key)
+                REFERENCES devices(public_key)
+        )
+    """)
+
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_devices_last_seen
+        ON devices(last_seen_at)
+    """)
+
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_sightings_observed_at
+        ON sightings(observed_at)
+    """)
+
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_sightings_public_key
+        ON sightings(public_key, observed_at)
+    """)
+
     conn.commit()
     conn.close()
 
@@ -103,6 +163,120 @@ def store_incoming_message(sender_key, message, snr):
             sender_key,
             message,
             snr,
+        ),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+# ---------------------------------------------------------
+# MeshCore device observation logger
+# ---------------------------------------------------------
+
+def public_node_id(public_key):
+    """Return a stable non-raw identifier suitable for future exports."""
+    return hashlib.sha256(
+        public_key.encode("utf-8")
+    ).hexdigest()[:12]
+
+
+def record_device_sighting(
+    public_key,
+    event_type,
+    advertised_name=None,
+    node_type=None,
+    snr=None,
+    advert_path_len=None,
+):
+    """Record one heard-device observation without copying message text."""
+    if not public_key:
+        return
+
+    observed_at = datetime.now().astimezone().isoformat(
+        timespec="seconds"
+    )
+    public_id = public_node_id(public_key)
+
+    user = get_user_by_key(public_key)
+    mailbox_name = user["display_name"] if user else None
+
+    conn = get_db()
+
+    conn.execute(
+        """
+        INSERT INTO devices (
+            public_key,
+            public_id,
+            advertised_name,
+            node_type,
+            first_seen_at,
+            last_seen_at,
+            last_event_type,
+            last_snr,
+            last_advert_path_len,
+            sighting_count
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+        ON CONFLICT(public_key) DO UPDATE SET
+            advertised_name = COALESCE(
+                excluded.advertised_name,
+                devices.advertised_name
+            ),
+            node_type = COALESCE(
+                excluded.node_type,
+                devices.node_type
+            ),
+            last_seen_at = excluded.last_seen_at,
+            last_event_type = excluded.last_event_type,
+            last_snr = COALESCE(
+                excluded.last_snr,
+                devices.last_snr
+            ),
+            last_advert_path_len = COALESCE(
+                excluded.last_advert_path_len,
+                devices.last_advert_path_len
+            ),
+            sighting_count = devices.sighting_count + 1
+        """,
+        (
+            public_key,
+            public_id,
+            advertised_name,
+            node_type,
+            observed_at,
+            observed_at,
+            event_type,
+            snr,
+            advert_path_len,
+        ),
+    )
+
+    conn.execute(
+        """
+        INSERT INTO sightings (
+            observed_at,
+            public_key,
+            public_id,
+            event_type,
+            advertised_name,
+            mailbox_name,
+            node_type,
+            snr,
+            advert_path_len
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            observed_at,
+            public_key,
+            public_id,
+            event_type,
+            advertised_name,
+            mailbox_name,
+            node_type,
+            snr,
+            advert_path_len,
         ),
     )
 
@@ -446,6 +620,34 @@ def get_weather_reply():
     return "\n".join(lines)
 
 
+def get_weather_summary():
+    """Return a short one-line weather summary for greetings."""
+    if not WEATHER_CACHE.exists():
+        return "Weather: unavailable."
+
+    try:
+        data = json.loads(WEATHER_CACHE.read_text())
+    except Exception:
+        return "Weather: unavailable."
+
+    current = data.get("current", {})
+    temp = current.get("temperature_f")
+    desc = current.get("description")
+
+    parts = []
+
+    if temp is not None:
+        parts.append(f"{temp}F")
+
+    if desc:
+        parts.append(desc)
+
+    if not parts:
+        return "Weather: unavailable."
+
+    return "Weather: " + ", ".join(parts)
+
+
 # ---------------------------------------------------------
 # Commands
 # ---------------------------------------------------------
@@ -457,6 +659,38 @@ def process_command(
 ):
     stripped = text.strip()
     upper = stripped.upper()
+    user = get_user_by_key(public_key)
+
+    if upper in {"HELLO", "HI", "HEY"}:
+        now = datetime.now()
+        lines = []
+
+        if user:
+            lines.append(f"Hello {user['display_name']}!")
+        else:
+            lines.append("Hello from NAC-BBS!")
+
+        lines.append("Nacogdoches, Texas")
+        lines.append(now.strftime("%b %d, %Y - %I:%M %p"))
+        lines.append(get_weather_summary())
+
+        if user:
+            unread, _ = mailbox_status(public_key)
+
+            if unread == 1:
+                lines.append("You have 1 unread message.")
+            else:
+                lines.append(f"You have {unread} unread messages.")
+
+            if unread:
+                lines.append("Send READ to read mail, or HELP for the menu.")
+            else:
+                lines.append("Send HELP for the menu.")
+        else:
+            lines.append("New here? Send REGISTER Your Name")
+            lines.append("Send HELP for the menu.")
+
+        return "\n".join(lines)
 
     if upper == "HELP":
         return (
@@ -490,8 +724,6 @@ def process_command(
         )
 
         return reply
-
-    user = get_user_by_key(public_key)
 
     if upper == "MAIL":
         if not user:
@@ -659,6 +891,9 @@ async def main():
             f"{len(contacts)} contacts."
         )
 
+    # Track the last courtesy advert sent for each client public key.
+    courtesy_advert_times = {}
+
     async def refresh_contacts():
         nonlocal contacts
 
@@ -668,6 +903,49 @@ async def main():
 
         if result.type != EventType.ERROR:
             contacts = result.payload
+
+    async def scheduled_advertisements():
+        while True:
+            now = datetime.now().astimezone()
+
+            if now.minute < 30:
+                next_run = now.replace(
+                    minute=30,
+                    second=0,
+                    microsecond=0,
+                )
+            else:
+                next_run = (
+                    now + timedelta(hours=1)
+                ).replace(
+                    minute=0,
+                    second=0,
+                    microsecond=0,
+                )
+
+            delay = (next_run - now).total_seconds()
+            await asyncio.sleep(delay)
+
+            print(
+                f"[{stamp()}] Sending scheduled "
+                f"NAC-BBS flood advertisement..."
+            )
+
+            result = await meshcore.commands.send_advert(
+                flood=True,
+            )
+
+            if result.type == EventType.ERROR:
+                print(
+                    f"[{stamp()}] ERROR sending scheduled "
+                    f"advertisement:"
+                )
+                print(result.payload)
+            else:
+                print(
+                    f"[{stamp()}] Scheduled NAC-BBS "
+                    f"flood advertisement sent."
+                )
 
     async def handle_contact_message(event):
         msg = event.payload
@@ -718,6 +996,14 @@ async def main():
             "",
         )
 
+        record_device_sighting(
+            public_key,
+            "DIRECT_MESSAGE",
+            advertised_name=advertised_name,
+            node_type=contact.get("type"),
+            snr=snr,
+        )
+
         store_incoming_message(
             public_key,
             text,
@@ -758,12 +1044,132 @@ async def main():
             )
 
     async def handle_advertisement(event):
+        advert_key = event.payload.get(
+            "public_key",
+            "",
+        )
+
         print(
             f"[{stamp()}] Advertisement: "
-            f"{event.payload.get('public_key', '')[:12]}"
+            f"{advert_key[:12]}"
         )
 
         await refresh_contacts()
+
+        public_key, contact = resolve_contact(
+            contacts,
+            advert_key,
+        )
+
+        if not public_key or not contact:
+            print(
+                f"[{stamp()}] Advertiser not found in "
+                f"contact cache after refresh."
+            )
+            return
+
+        name = contact.get(
+            "adv_name",
+            public_key[:12],
+        )
+        node_type = contact.get("type")
+        path_len = None
+
+        # The Companion exposes the route taken by the most recently
+        # received advert separately from the normal stored route.
+        get_advert_path = getattr(
+            meshcore.commands,
+            "get_advert_path",
+            None,
+        )
+
+        if get_advert_path is not None:
+            path_result = await get_advert_path(contact)
+
+            if (
+                path_result is not None
+                and path_result.type != EventType.ERROR
+            ):
+                path_len = path_result.payload.get(
+                    "path_len"
+                )
+
+        record_device_sighting(
+            public_key,
+            "ADVERTISEMENT",
+            advertised_name=name,
+            node_type=node_type,
+            advert_path_len=path_len,
+        )
+
+        # Courtesy adverts are only useful for client/companion nodes.
+        if node_type != MESHCORE_CLIENT_TYPE:
+            return
+
+        if path_len is None:
+            print(
+                f"[{stamp()}] Could not determine advert "
+                f"path for {name}; no courtesy advert sent."
+            )
+            return
+
+        # path_len == 0 means the advertiser was heard directly.
+        # A non-zero path arrived through repeaters, so a zero-hop
+        # courtesy advert would not reach that remote client.
+        if path_len != 0:
+            print(
+                f"[{stamp()}] {name} advert path is "
+                f"{path_len}; not a direct neighbor. "
+                f"No zero-hop courtesy advert."
+            )
+            return
+
+        now = asyncio.get_running_loop().time()
+        last_sent = courtesy_advert_times.get(public_key)
+
+        if last_sent is not None:
+            elapsed = now - last_sent
+
+            if elapsed < COURTESY_ADVERT_COOLDOWN_SECONDS:
+                remaining = int(
+                    COURTESY_ADVERT_COOLDOWN_SECONDS
+                    - elapsed
+                )
+
+                print(
+                    f"[{stamp()}] Direct advert from {name}; "
+                    f"courtesy advert cooldown has "
+                    f"{remaining}s remaining."
+                )
+                return
+
+        await asyncio.sleep(
+            COURTESY_ADVERT_DELAY_SECONDS
+        )
+
+        print(
+            f"[{stamp()}] Direct client advert from {name}; "
+            f"sending NAC-BBS zero-hop courtesy advert..."
+        )
+
+        result = await meshcore.commands.send_advert(
+            flood=False,
+        )
+
+        if result.type == EventType.ERROR:
+            print(
+                f"[{stamp()}] ERROR sending zero-hop "
+                f"courtesy advert for {name}:"
+            )
+            print(result.payload)
+            return
+
+        courtesy_advert_times[public_key] = now
+
+        print(
+            f"[{stamp()}] Zero-hop courtesy advert "
+            f"sent for {name}."
+        )
 
     async def handle_new_contact(event):
         print(
@@ -805,14 +1211,20 @@ async def main():
             f"[{stamp()}] NAC-BBS flood advertisement sent."
         )
 
-    print()
-    print(f"[{stamp()}] NAC-BBS is online.")
+    advert_task = asyncio.create_task(
+        scheduled_advertisements()
+    )
 
     print()
     print(f"[{stamp()}] NAC-BBS is online.")
     print(
-        "Commands: HELP, ABOUT, TIME, WX, "
+        "Commands: HELLO, HELP, ABOUT, TIME, WX, "
         "REGISTER, MAIL, READ, SEND"
+    )
+    print("Scheduled flood adverts: :00 and :30 each hour.")
+    print(
+        "Courtesy zero-hop advert: direct clients, "
+        "30-minute per-client cooldown."
     )
     print("Press Ctrl+C to stop.")
     print()
@@ -826,6 +1238,13 @@ async def main():
         print(f"[{stamp()}] Shutting down...")
 
     finally:
+        advert_task.cancel()
+
+        try:
+            await advert_task
+        except asyncio.CancelledError:
+            pass
+
         await meshcore.stop_auto_message_fetching()
         await meshcore.disconnect()
 
