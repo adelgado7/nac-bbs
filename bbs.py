@@ -25,6 +25,10 @@ COURTESY_ADVERT_COOLDOWN_SECONDS = 30 * 60
 COURTESY_ADVERT_DELAY_SECONDS = 1.0
 MESHCORE_CLIENT_TYPE = 1
 
+# Community directory behavior.
+DIR_PAGE_SIZE = 10
+PLAN_MAX_LENGTH = 120
+
 
 def stamp():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -62,9 +66,20 @@ def init_db():
             display_name TEXT NOT NULL COLLATE NOCASE UNIQUE,
             advertised_name TEXT,
             created_at TEXT NOT NULL,
-            last_seen_at TEXT NOT NULL
+            last_seen_at TEXT NOT NULL,
+            plan TEXT
         )
     """)
+
+    # Existing databases predate the optional .plan field. Add it in
+    # place without disturbing registered users or mailbox data.
+    user_columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(users)").fetchall()
+    }
+
+    if "plan" not in user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN plan TEXT")
 
     # Persistent mailbox
     conn.execute("""
@@ -407,6 +422,118 @@ def register_user(
     )
 
 
+def get_directory_page(page=1):
+    """Return one alphabetized page of registered mailbox names."""
+    conn = get_db()
+
+    total = conn.execute(
+        "SELECT COUNT(*) AS count FROM users"
+    ).fetchone()["count"]
+
+    total_pages = max(
+        1,
+        (total + DIR_PAGE_SIZE - 1) // DIR_PAGE_SIZE,
+    )
+
+    if page < 1 or page > total_pages:
+        conn.close()
+        return None, total, total_pages
+
+    offset = (page - 1) * DIR_PAGE_SIZE
+
+    rows = conn.execute(
+        """
+        SELECT display_name
+        FROM users
+        ORDER BY display_name COLLATE NOCASE
+        LIMIT ? OFFSET ?
+        """,
+        (DIR_PAGE_SIZE, offset),
+    ).fetchall()
+
+    conn.close()
+    return rows, total, total_pages
+
+
+def directory_reply(page=1):
+    rows, total, total_pages = get_directory_page(page)
+
+    if rows is None:
+        return (
+            f"Directory has {total_pages} page(s). "
+            f"Use DIR 1 through DIR {total_pages}."
+        )
+
+    lines = [
+        "NAC-BBS Mailbox Directory",
+        f"Page {page} of {total_pages} - {total} registered",
+    ]
+
+    start_number = ((page - 1) * DIR_PAGE_SIZE) + 1
+
+    for index, row in enumerate(rows, start=start_number):
+        lines.append(f"{index}. {row['display_name']}")
+
+    if total_pages > 1:
+        lines.append("Use DIR <page> for more.")
+
+    return "\n".join(lines)
+
+
+def set_user_plan(public_key, plan):
+    """Set, replace, or clear a registered user's short public .plan."""
+    plan = plan.strip()
+
+    if len(plan) > PLAN_MAX_LENGTH:
+        return (
+            f"Plan too long. Maximum is "
+            f"{PLAN_MAX_LENGTH} characters."
+        )
+
+    conn = get_db()
+    conn.execute(
+        """
+        UPDATE users
+        SET plan = ?
+        WHERE public_key = ?
+        """,
+        (plan or None, public_key),
+    )
+    conn.commit()
+    conn.close()
+
+    if plan:
+        return "Your .plan has been updated."
+
+    return "Your .plan has been cleared."
+
+
+def who_reply(display_name):
+    user = get_user_by_name(display_name)
+
+    if not user:
+        return f"No registered user named {display_name}."
+
+    lines = [
+        user["display_name"],
+        "Registered NAC-BBS user",
+        "",
+    ]
+
+    plan = user["plan"]
+
+    if plan:
+        lines.extend([
+            "Plan:",
+            plan,
+        ])
+    else:
+        lines.append("No plan set.")
+
+    return "\n".join(lines)
+
+
+
 def update_last_seen(public_key, advertised_name=None):
     conn = get_db()
 
@@ -696,7 +823,8 @@ def process_command(
         return (
             "NAC-BBS: HELP ABOUT TIME WX "
             "REGISTER <name> MAIL READ "
-            "SEND <name>|<message>"
+            "SEND <name>|<message> DIR [page] "
+            "WHO <name> PLAN [text|CLEAR]"
         )
 
     if upper == "ABOUT":
@@ -724,6 +852,66 @@ def process_command(
         )
 
         return reply
+
+    if upper == "DIR" or upper.startswith("DIR "):
+        if upper == "DIR":
+            page = 1
+        else:
+            page_text = stripped[4:].strip()
+
+            try:
+                page = int(page_text)
+            except ValueError:
+                return "Usage: DIR or DIR <page>"
+
+        return directory_reply(page)
+
+    if upper.startswith("WHO "):
+        display_name = stripped[4:].strip()
+
+        if not display_name:
+            return "Usage: WHO <name>"
+
+        return who_reply(display_name)
+
+    if upper == "WHO":
+        return "Usage: WHO <name>"
+
+    if upper == "PLAN":
+        if not user:
+            return (
+                "You are not registered. "
+                "Use REGISTER <name> first."
+            )
+
+        if user["plan"]:
+            return f"Your .plan: {user['plan']}"
+
+        return "You have no .plan set. Use PLAN <text>."
+
+    if upper == "PLAN CLEAR":
+        if not user:
+            return (
+                "You are not registered. "
+                "Use REGISTER <name> first."
+            )
+
+        return set_user_plan(public_key, "")
+
+    if upper.startswith("PLAN "):
+        if not user:
+            return (
+                "You are not registered. "
+                "Use REGISTER <name> first."
+            )
+
+        plan = stripped[5:].strip()
+
+        if not plan:
+            return "Usage: PLAN <text> or PLAN CLEAR"
+
+        return set_user_plan(public_key, plan)
+
 
     if upper == "MAIL":
         if not user:
@@ -1219,7 +1407,7 @@ async def main():
     print(f"[{stamp()}] NAC-BBS is online.")
     print(
         "Commands: HELLO, HELP, ABOUT, TIME, WX, "
-        "REGISTER, MAIL, READ, SEND"
+        "REGISTER, MAIL, READ, SEND, DIR, WHO, PLAN"
     )
     print("Scheduled flood adverts: :00 and :30 each hour.")
     print(
