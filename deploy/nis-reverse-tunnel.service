@@ -1,0 +1,26 @@
+[Unit]
+Description=NAC-BBS Reverse SSH Tunnel to NIS
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=nac-bbs
+Environment="AUTOSSH_GATETIME=0"
+
+ExecStart=/usr/bin/autossh -M 0 -N -T \
+  -i /home/nac-bbs/.ssh/nis_tunnel_ed25519 \
+  -o IdentitiesOnly=yes \
+  -o BatchMode=yes \
+  -o StrictHostKeyChecking=yes \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=30 \
+  -o ServerAliveCountMax=3 \
+  -R localhost:2222:localhost:22 \
+  meshcore-tunnel@nis.apollos-dev.com
+
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

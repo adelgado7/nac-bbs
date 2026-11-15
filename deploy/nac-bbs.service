@@ -1,0 +1,20 @@
+[Unit]
+Description=NAC-BBS MeshCore Bulletin Board System
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nac-bbs
+Group=nac-bbs
+WorkingDirectory=/home/nac-bbs/meshcore-bbs
+ExecStart=/home/nac-bbs/meshcore-bbs/venv/bin/python /home/nac-bbs/meshcore-bbs/bbs.py
+
+Restart=on-failure
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

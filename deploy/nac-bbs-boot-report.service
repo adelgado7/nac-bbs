@@ -1,0 +1,13 @@
+[Unit]
+Description=NAC-BBS boot email report
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=nac-bbs
+Group=nac-bbs
+ExecStart=/home/nac-bbs/meshcore-bbs/send_boot_report.sh
+
+[Install]
+WantedBy=multi-user.target
