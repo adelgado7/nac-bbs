@@ -821,10 +821,19 @@ def process_command(
 
     if upper == "HELP":
         return (
-            "NAC-BBS: HELP ABOUT TIME WX "
-            "REGISTER <name> MAIL READ "
-            "SEND <name>|<message> DIR [page] "
-            "WHO <name> PLAN [text|CLEAR]"
+            "NAC-BBS HELP\n"
+            "HELLO HELP ABOUT TIME WX BYE\n"
+            "REGISTER <name>\n"
+            "MAIL READ\n"
+            "SEND <name>|<message>\n"
+            "DIR [page] WHO <name>\n"
+            "PLAN [text|CLEAR]"
+        )
+
+    if upper == "BYE":
+        return (
+            "NAC-BBS: Nice talking with you! "
+            "Stop by and say hello when you're back. Take care!"
         )
 
     if upper == "ABOUT":
@@ -1407,7 +1416,7 @@ async def main():
     print(f"[{stamp()}] NAC-BBS is online.")
     print(
         "Commands: HELLO, HELP, ABOUT, TIME, WX, "
-        "REGISTER, MAIL, READ, SEND, DIR, WHO, PLAN"
+        "REGISTER, MAIL, READ, SEND, DIR, WHO, PLAN, BYE"
     )
     print("Scheduled flood adverts: :00 and :30 each hour.")
     print(
