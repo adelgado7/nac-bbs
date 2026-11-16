@@ -328,6 +328,61 @@ def update_contact(db_path, identifier):
 
 
 
+
+def withdraw_consent(db_path, public_key):
+    """Withdraw contact consent and clear stored contact details atomically."""
+    conn = connect_write(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        user = conn.execute(
+            """SELECT display_name, email, mobile_phone, contact_consent
+               FROM users WHERE public_key = ?""",
+            (public_key,),
+        ).fetchone()
+        if user is None:
+            print("User not found. Supply the complete public key.")
+            return
+        if not (user["email"] or user["mobile_phone"] or user["contact_consent"]):
+            print("No stored contact details or active consent. No change made.")
+            return
+
+        print(f"User: {user['display_name']}")
+        print(f"Public key: {public_key}")
+        print("This will clear email and mobile phone and withdraw consent.")
+        if input("Type WITHDRAW to confirm: ").strip() != "WITHDRAW":
+            print("Cancelled. No changes made.")
+            return
+
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            """UPDATE users SET email = NULL, mobile_phone = NULL,
+                      contact_consent = 0, contact_updated_at = ?
+               WHERE public_key = ?""",
+            (now, public_key),
+        )
+        conn.execute(
+            """INSERT INTO admin_audit_log
+                   (created_at, actor, action, target_key, details_json)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                now, getpass.getuser(), "withdraw_contact_consent",
+                public_key,
+                json.dumps({
+                    "email_cleared": bool(user["email"]),
+                    "mobile_cleared": bool(user["mobile_phone"]),
+                    "consent_withdrawn": bool(user["contact_consent"]),
+                }),
+            ),
+        )
+        conn.commit()
+        print("Consent withdrawn; contact details cleared and action audited.")
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 VALID_ROLES = ("superadmin", "admin", "sysop")
 
 
@@ -527,6 +582,11 @@ def main():
     )
     contact_parser.add_argument("identifier")
 
+    withdraw_parser = subparsers.add_parser(
+        "withdraw-consent", help="Clear contact details and withdraw consent"
+    )
+    withdraw_parser.add_argument("public_key")
+
     grant_parser = subparsers.add_parser(
         "grant-role", help="Assign or change a BBS administrator role"
     )
@@ -545,6 +605,10 @@ def main():
     rename_parser.add_argument("new_name")
 
     args = parser.parse_args()
+
+    if args.command == "withdraw-consent":
+        withdraw_consent(args.db, args.public_key)
+        return
 
     if args.command == "grant-role":
         grant_role(args.db, args.public_key, args.role)
