@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from meshcore import MeshCore, EventType
+import mailbox_v1
 
 
 DEVICE = (
@@ -153,6 +154,8 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_sightings_public_key
         ON sightings(public_key, observed_at)
     """)
+
+    mailbox_v1.ensure_schema(conn)
 
     conn.commit()
     conn.close()
@@ -824,7 +827,7 @@ def process_command(
             "NAC-BBS HELP\n"
             "HELLO HELP ABOUT TIME WX BYE\n"
             "REGISTER <name>\n"
-            "MAIL READ\n"
+            "MAIL READ; HELP MAIL\n"
             "SEND <name>|<message>\n"
             "DIR [page] WHO <name>\n"
             "PLAN [text|CLEAR]"
@@ -921,6 +924,10 @@ def process_command(
 
         return set_user_plan(public_key, plan)
 
+
+    mailbox_response = mailbox_v1.handle(stripped, public_key, user, get_db)
+    if mailbox_response is not None:
+        return mailbox_response
 
     if upper == "MAIL":
         if not user:
