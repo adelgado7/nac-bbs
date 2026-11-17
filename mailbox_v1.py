@@ -4,6 +4,7 @@ import sqlite3
 
 PAGE_SIZE = 5
 MAX_MESSAGE = 500
+READ_REPLY_MAX_BYTES = 140  # Conservative; verify on actual MeshCore radio.
 
 
 def now():
@@ -53,7 +54,22 @@ def _list(conn, key, page, unread=False, sent=False):
     return "\n".join(lines)
 
 
-def _read(conn, key, msg_id=None):
+def _chunks_utf8(text, budget):
+    chunks = []
+    chunk = ""
+    for char in text:
+        if len((chunk + char).encode("utf-8")) > budget:
+            if chunk:
+                chunks.append(chunk)
+            chunk = char
+        else:
+            chunk += char
+    if chunk:
+        chunks.append(chunk)
+    return chunks or [""]
+
+
+def _read(conn, key, msg_id=None, part=1):
     if msg_id is None:
         row = conn.execute("""SELECT m.id,m.message,m.created_at,u.display_name AS name
             FROM mail m JOIN users u ON u.public_key=m.sender_key
@@ -66,13 +82,23 @@ def _read(conn, key, msg_id=None):
             (key,msg_id)).fetchone()
     if row is None:
         return "No unread mail." if msg_id is None else "Message not found in your inbox."
+    header = f"#{row['id']} {row['name']}: "
+    budget = READ_REPLY_MAX_BYTES - len(header.encode("utf-8")) - 32
+    if budget < 20:
+        return "Sender name too long for radio reply."
+    chunks = _chunks_utf8(row["message"], budget)
+    if part < 1 or part > len(chunks):
+        return f"Message {row['id']} has {len(chunks)} part(s)."
     with conn:
         conn.execute("UPDATE mail SET read_at=COALESCE(read_at,?) WHERE id=? AND recipient_key=?",
                      (now(),row["id"],key))
         conn.execute("""INSERT INTO mailbox_state(public_key,last_read_id) VALUES (?,?)
             ON CONFLICT(public_key) DO UPDATE SET last_read_id=excluded.last_read_id""",
             (key,row["id"]))
-    return f"Msg {row['id']} from {row['name']} ({row['created_at']}): {row['message']}"
+    suffix = f" ({part}/{len(chunks)})"
+    if part < len(chunks):
+        suffix += f" READ {row['id']} {part+1}"
+    return header + chunks[part-1] + suffix
 
 
 def _reply(conn, key, rest):
@@ -121,7 +147,7 @@ def handle(text, key, user, get_db):
     cmd = aliases.get(cmd,cmd)
     supported = {"MAIL","LIST","NEW","READ","REPLY","SENT","DELETE","KM"}
     if cmd == "HELP" and len(parts)>1 and parts[1].strip().upper()=="MAIL":
-        return ("MAIL counts; LIST [page]; NEW [page]; READ [id]; "
+        return ("MAIL counts; LIST [page]; NEW [page]; READ [id] [part]; "
                 "REPLY <text> or REPLY <id> <text>; SENT [page]; "
                 "DELETE <id>; KM CONFIRM (delete read mail). "
                 "Shortcuts: L LN R K.")
@@ -146,10 +172,14 @@ def handle(text, key, user, get_db):
                 return f"Usage: {cmd} [page]"
             return _list(conn,key,page,unread=cmd=="NEW",sent=cmd=="SENT")
         if cmd == "READ":
-            msg_id = _page(rest) if rest else None
-            if rest and msg_id is None:
-                return "Usage: READ [id]"
-            return _read(conn,key,msg_id)
+            args = rest.split()
+            if len(args) > 2:
+                return "Usage: READ [id] [part]"
+            msg_id = _page(args[0]) if args else None
+            part = _page(args[1]) if len(args) == 2 else 1
+            if (args and msg_id is None) or part is None:
+                return "Usage: READ [id] [part]"
+            return _read(conn,key,msg_id,part)
         if cmd == "REPLY":
             return _reply(conn,key,rest)
         if cmd == "DELETE":
