@@ -65,6 +65,23 @@ class MailboxTests(unittest.TestCase):
         self.assertIn("Removed 1",self.run_cmd("b","KM CONFIRM"))
         self.assertIn("0 total",self.run_cmd("b","MAIL"))
 
+    def test_long_read_is_paginated_and_utf8_safe(self):
+        body = "Café 📻 " * 65
+        self.keep.execute("UPDATE mail SET message=? WHERE id=1", (body,))
+        self.keep.commit()
+        parts = []
+        for page in range(1, 30):
+            response = self.run_cmd("b", f"READ 1 {page}")
+            if "has " in response and "part(s)" in response:
+                break
+            self.assertLessEqual(len(response.encode("utf-8")), m.READ_REPLY_MAX_BYTES)
+            parts.append(response)
+            if f"READ 1 {page+1}" not in response:
+                break
+        self.assertGreater(len(parts), 1)
+        self.assertIn("Café", "".join(parts))
+        self.assertIn("has ", self.run_cmd("b", "READ 1 99"))
+
     def test_pagination_and_invalid_inputs(self):
         self.assertIn("Usage",self.run_cmd("b","LIST -1"))
         self.assertIn("Usage",self.run_cmd("b","READ nope"))
