@@ -155,9 +155,9 @@ def handle(text, key, user, get_db):
     cmd = aliases.get(cmd,cmd)
     supported = {"MAIL","LIST","NEW","READ","REPLY","SENT","DELETE","KM"}
     if cmd == "HELP" and len(parts)>1 and parts[1].upper()=="MAIL":
-        return ("MAIL; LIST [p]; NEW [p]; READ [id] [part]; "
+        return ("MAIL; SEND <name>|<message>; LIST [p]; NEW [p]; READ [id] [part]; "
                 "REPLY [id] <text>; SENT [p]; DELETE <id>; "
-                "KM CONFIRM. Shortcuts: L LN R K.")
+                "KM CONFIRM. Aliases: L LN R K.")
     if cmd not in supported:
         if mail_prefix:
             return "Unknown mail command. Send HELP MAIL."
