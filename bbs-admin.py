@@ -552,7 +552,7 @@ def revoke_role(db_path, public_key):
 
 
 def board_admin(db_path, action, name=None, description="",
-                author=None, message=""):
+                author=None, message="", page=1, reason=""):
     """Manage public boards from the Pi's local terminal."""
     conn = connect_write(db_path)
     try:
@@ -590,6 +590,22 @@ def board_admin(db_path, action, name=None, description="",
                 conn, user["public_key"], name, message
             )
             print(f"As {user['display_name']}: {reply}")
+            return
+
+        if action == "posts":
+            print(boards_v1.list_posts_for_moderation(conn, page))
+            return
+
+        if action in {"hide", "restore"}:
+            try:
+                post_id = int(name)
+            except (TypeError, ValueError):
+                print("Post ID must be a number.")
+                return
+            changed, reply = boards_v1.moderate_post(
+                conn, getpass.getuser(), post_id, action, reason
+            )
+            print(reply)
             return
 
         status = "archived" if action == "archive" else "active"
@@ -631,6 +647,10 @@ def main():
     )
     user_parser.add_argument("identifier")
 
+    subparsers.add_parser(
+        "roles", help="List assigned BBS administrator roles"
+    )
+
     contact_parser = subparsers.add_parser(
         "contact", help="Update a user's contact information"
     )
@@ -665,6 +685,10 @@ def main():
         dest="board_action", required=True
     )
     board_actions.add_parser("list", help="List boards and their status")
+    posts_parser = board_actions.add_parser(
+        "posts", help="List public posts for moderation"
+    )
+    posts_parser.add_argument("--page", type=int, default=1)
     create_board_parser = board_actions.add_parser(
         "create", help="Create a public board"
     )
@@ -681,6 +705,14 @@ def main():
     post_board_parser.add_argument(
         "--message", required=True, help="Public post text"
     )
+    for action in ("hide-post", "restore-post"):
+        mod_parser = board_actions.add_parser(
+            action, help=f"{action.replace('-', ' ').capitalize()} a public post"
+        )
+        mod_parser.add_argument("post_id", help="Public post ID")
+        if action == "hide-post":
+            mod_parser.add_argument("--reason", default="",
+                                    help="Optional moderation reason")
     for action in ("archive", "restore"):
         action_parser = board_actions.add_parser(
             action, help=f"{action.capitalize()} a board without deleting its posts"
@@ -717,6 +749,12 @@ def main():
         elif args.board_action == "post":
             board_admin(args.db, "post", args.name,
                         author=args.author, message=args.message)
+        elif args.board_action == "posts":
+            board_admin(args.db, "posts", page=args.page)
+        elif args.board_action in {"hide-post", "restore-post"}:
+            action = "hide" if args.board_action == "hide-post" else "restore"
+            board_admin(args.db, action, args.post_id,
+                        reason=getattr(args, "reason", ""))
         else:
             board_admin(args.db, args.board_action, args.name)
         return
@@ -724,6 +762,25 @@ def main():
     with connect(args.db) as conn:
         if args.command == "users":
             list_users(conn)
+        elif args.command == "roles":
+            role_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='admin_roles'"
+            ).fetchone()
+            if not role_table:
+                print("Admin roles are not installed. Run migrations/001_admin_support.py.")
+            else:
+                rows = conn.execute("""SELECT u.display_name, a.role, a.granted_at
+                    FROM admin_roles a JOIN users u ON u.public_key = a.public_key
+                    ORDER BY CASE a.role WHEN 'superadmin' THEN 0
+                        WHEN 'admin' THEN 1 ELSE 2 END,
+                        u.display_name COLLATE NOCASE""").fetchall()
+                if not rows:
+                    print("No administrator roles are assigned.")
+                else:
+                    print(f"\n{'NAME':24} {'ROLE':12} GRANTED")
+                    print("-" * 60)
+                    for row in rows:
+                        print(f"{row['display_name'][:24]:24} {row['role']:12} {row['granted_at']}")
         elif args.command == "find":
             list_users(conn, args.name)
         elif args.command == "user":

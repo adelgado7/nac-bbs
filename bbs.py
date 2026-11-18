@@ -828,15 +828,138 @@ def _process_admin_board_command(text, public_key, conn):
 
 
 def _is_superadmin(public_key, conn):
+    return _bbs_role(public_key, conn) == "superadmin"
+
+
+def _bbs_role(public_key, conn):
     has_roles = conn.execute("""SELECT 1 FROM sqlite_master
         WHERE type = 'table' AND name = 'admin_roles'""").fetchone()
     if not has_roles:
-        return False
+        return None
     row = conn.execute(
         "SELECT role FROM admin_roles WHERE public_key = ?",
         (public_key,),
     ).fetchone()
-    return bool(row and row["role"] == "superadmin")
+    return row["role"] if row else None
+
+
+def _can_moderate(public_key, conn):
+    return _bbs_role(public_key, conn) in {"superadmin", "admin", "sysop"}
+
+
+def _process_moderation_command(text, public_key, conn):
+    """Moderate individual board posts without deleting their history."""
+    parts = text.split(None, 3)
+    if len(parts) < 3 or parts[2].upper() == "HELP":
+        return (
+            "ADMIN MOD LIST [page]; HIDE <id>|<reason>; "
+            "RESTORE <id>; hides retain audit history."
+        )
+
+    action = parts[2].upper()
+    payload = parts[3].strip() if len(parts) > 3 else ""
+    if action == "LIST":
+        try:
+            page = int(payload or "1")
+        except ValueError:
+            return "Usage: ADMIN MOD LIST [page]"
+        return boards_v1.list_posts_for_moderation(conn, page)
+
+    if action in {"HIDE", "RESTORE"} and payload:
+        if "|" in payload:
+            post_text, reason = payload.split("|", 1)
+        else:
+            post_text, reason = payload, ""
+        try:
+            post_id = int(post_text.strip())
+        except ValueError:
+            return f"Usage: ADMIN MOD {action} <post-id>" + ("|<reason>" if action == "HIDE" else "")
+        _, reply = boards_v1.moderate_post(
+            conn, public_key, post_id, action.lower(), reason
+        )
+        return reply
+
+    return "Use ADMIN MOD LIST [page], HIDE <id>|<reason>, or RESTORE <id>."
+
+
+def _process_admin_role_command(text, public_key, conn):
+    """Allow superadmins to assign or remove moderator roles over the air."""
+    parts = text.split(None, 3)
+    if len(parts) < 3 or parts[2].upper() == "HELP":
+        return "ADMIN ROLE LIST [page]; GRANT <name>|sysop; REVOKE <name>."
+    if not conn.execute("""SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'admin_roles'""").fetchone():
+        return "Admin roles are not installed on this BBS."
+
+    action = parts[2].upper()
+    payload = parts[3].strip() if len(parts) > 3 else ""
+    if action == "LIST":
+        try:
+            page = int(payload or "1")
+        except ValueError:
+            return "Usage: ADMIN ROLE LIST [page]"
+        if page < 1:
+            return "Use ADMIN ROLE LIST [page]."
+        size = 3
+        total = conn.execute("SELECT COUNT(*) FROM admin_roles").fetchone()[0]
+        pages = max(1, (total + size - 1) // size)
+        if page > pages:
+            return f"Roles: {total}. Use ADMIN ROLE LIST 1-{pages}."
+        rows = conn.execute("""SELECT u.display_name, a.role
+            FROM admin_roles a JOIN users u ON u.public_key = a.public_key
+            ORDER BY u.display_name COLLATE NOCASE LIMIT ? OFFSET ?""",
+            (size, (page - 1) * size)).fetchall()
+        if not rows:
+            return "No administrator roles are assigned."
+        lines = [f"BBS roles {page}/{pages}:"]
+        lines.extend(f"{row['display_name'][:20]}={row['role']}" for row in rows)
+        if page < pages:
+            lines.append(f"More: ADMIN ROLE LIST {page + 1}")
+        return boards_v1.radio_limit("; ".join(lines))
+
+    if action == "GRANT" and "|" in payload:
+        name, role = (piece.strip() for piece in payload.split("|", 1))
+        role = role.lower()
+        if role not in {"sysop", "admin"}:
+            return "Assign sysop or admin here; superadmin changes use the local terminal."
+        if not name:
+            return "Usage: ADMIN ROLE GRANT <registered name>|sysop"
+        target = conn.execute("""SELECT public_key, display_name FROM users
+            WHERE display_name = ? COLLATE NOCASE""", (name,)).fetchone()
+        if target is None:
+            return "Registered user not found. Check the exact BBS display name."
+        existing = conn.execute("SELECT role FROM admin_roles WHERE public_key = ?",
+                                 (target["public_key"],)).fetchone()
+        old_role = existing["role"] if existing else "user"
+        if old_role == role:
+            return f"{target['display_name']} already has role {role}."
+        stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        with conn:
+            conn.execute("""INSERT INTO admin_roles
+                (public_key, role, granted_at, granted_by) VALUES (?, ?, ?, ?)
+                ON CONFLICT(public_key) DO UPDATE SET role=excluded.role,
+                    granted_at=excluded.granted_at, granted_by=excluded.granted_by""",
+                (target["public_key"], role, stamp, public_key))
+            boards_v1.audit(conn, public_key, "grant_role", target["public_key"],
+                            f"{old_role} -> {role}")
+        return f"Assigned {role} to {target['display_name']}."
+
+    if action == "REVOKE" and payload:
+        target = conn.execute("""SELECT u.public_key, u.display_name, a.role
+            FROM users u JOIN admin_roles a ON a.public_key = u.public_key
+            WHERE u.display_name = ? COLLATE NOCASE""", (payload,)).fetchone()
+        if target is None:
+            return "Moderator not found. Check the exact BBS display name."
+        if target["role"] == "superadmin":
+            return "Superadmin roles can only be changed from the local terminal."
+        with conn:
+            conn.execute("DELETE FROM admin_roles WHERE public_key = ?",
+                         (target["public_key"],))
+            boards_v1.audit(conn, public_key, "revoke_role", target["public_key"],
+                            f"Removed role {target['role']}")
+        return f"Removed {target['role']} role from {target['display_name']}."
+
+    return "Use ADMIN ROLE LIST [page], GRANT <name>|sysop, or REVOKE <name>."
 
 def process_command(
     text,
@@ -910,6 +1033,24 @@ def process_command(
         finally:
             conn.close()
 
+    if upper.startswith("ADMIN MOD"):
+        conn = get_db()
+        try:
+            if not _can_moderate(public_key, conn):
+                return "Sysop or admin access required."
+            return _process_moderation_command(stripped, public_key, conn)
+        finally:
+            conn.close()
+
+    if upper.startswith("ADMIN ROLE"):
+        conn = get_db()
+        try:
+            if not _is_superadmin(public_key, conn):
+                return "Superadmin access required."
+            return _process_admin_role_command(stripped, public_key, conn)
+        finally:
+            conn.close()
+
     if upper in {"HELLO", "HI", "HEY"}:
         now = datetime.now()
         lines = []
@@ -967,14 +1108,21 @@ def process_command(
             "ADMIN BOARD: admin tools."
         )
 
+    if upper == "HELP MOD":
+        conn = get_db()
+        try:
+            if not _can_moderate(public_key, conn):
+                return "Moderator help is available to assigned sysops/admins."
+            return _process_moderation_command("ADMIN MOD HELP", public_key, conn)
+        finally:
+            conn.close()
+
     if upper == "HELP ADMIN":
         conn = get_db()
         try:
             if not _is_superadmin(public_key, conn):
                 return "Superadmin access required."
-            return _process_admin_board_command(
-                "ADMIN BOARD HELP", public_key, conn
-            )
+            return "ADMIN ROLE LIST; GRANT name|sysop; REVOKE name. ADMIN BOARD HELP."
         finally:
             conn.close()
 

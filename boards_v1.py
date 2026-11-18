@@ -9,6 +9,8 @@ BOARD_DESCRIPTION_MAX = 100
 BOARD_POST_MAX = 300
 BOARD_LIST_PAGE_SIZE = 3
 BOARD_PREVIEW_CHARS = 35
+MODERATION_PAGE_SIZE = 2
+MODERATION_REASON_MAX = 120
 
 
 def now():
@@ -36,6 +38,16 @@ def ensure_schema(conn):
         FOREIGN KEY (board_id) REFERENCES boards(id),
         FOREIGN KEY (author_key) REFERENCES users(public_key)
     )""")
+    # Additive, startup-safe migration for databases created before moderation.
+    post_columns = {row["name"] for row in conn.execute("PRAGMA table_info(board_posts)")}
+    post_additions = {
+        "moderated_at": "TEXT",
+        "moderated_by": "TEXT",
+        "moderation_reason": "TEXT",
+    }
+    for name, definition in post_additions.items():
+        if name not in post_columns:
+            conn.execute(f"ALTER TABLE board_posts ADD COLUMN {name} {definition}")
     conn.execute("""CREATE INDEX IF NOT EXISTS idx_board_posts_recent
         ON board_posts(board_id, id DESC)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS admin_audit_log (
@@ -147,14 +159,15 @@ def board_preview(conn, board_name, page=1):
     board = find_board(conn, board_name, active_only=True)
     if board is None:
         return "Active board not found. Send BOARDS to list boards."
-    total = conn.execute("SELECT COUNT(*) FROM board_posts WHERE board_id = ?",
+    total = conn.execute("SELECT COUNT(*) FROM board_posts WHERE board_id = ? AND moderated_at IS NULL",
                          (board["id"],)).fetchone()[0]
     pages = max(1, total)
     if page < 1 or page > pages:
         return f"Posts: {pages}. Use BOARD {board['name']} 1-{pages}."
     row = conn.execute("""SELECT p.id, p.body, p.created_at, u.display_name
         FROM board_posts p JOIN users u ON u.public_key = p.author_key
-        WHERE p.board_id = ? ORDER BY p.id DESC LIMIT 1 OFFSET ?""",
+        WHERE p.board_id = ? AND p.moderated_at IS NULL
+        ORDER BY p.id DESC LIMIT 1 OFFSET ?""",
         (board["id"], page - 1)).fetchone()
     lines = [f"{board['name']} post {page}/{pages}"]
     if row is None:
@@ -171,7 +184,7 @@ def board_preview(conn, board_name, page=1):
 def read_post(conn, post_id, part=1):
     row = conn.execute("""SELECT p.id, p.body, u.display_name
         FROM board_posts p JOIN users u ON u.public_key = p.author_key
-        WHERE p.id = ?""", (post_id,)).fetchone()
+        WHERE p.id = ? AND p.moderated_at IS NULL""", (post_id,)).fetchone()
     if row is None:
         return "Board post not found."
     header = f"#{row['id']} {row['display_name']}: "
@@ -183,6 +196,71 @@ def read_post(conn, post_id, part=1):
     if part < len(chunks):
         suffix += f" BREAD {post_id} {part + 1}"
     return radio_limit(header + chunks[part - 1] + suffix)
+
+
+def moderate_post(conn, actor_key, post_id, action, reason=""):
+    """Hide or restore a public post, retaining the original for audit/review."""
+    action = action.strip().lower()
+    if action not in {"hide", "restore"}:
+        return False, "Use HIDE or RESTORE."
+    reason = " ".join(reason.strip().split())
+    if len(reason) > MODERATION_REASON_MAX:
+        return False, f"Reason must be {MODERATION_REASON_MAX} characters or less."
+    row = conn.execute(
+        "SELECT id, moderated_at FROM board_posts WHERE id = ?", (post_id,)
+    ).fetchone()
+    if row is None:
+        return False, "Board post not found."
+    if action == "hide" and row["moderated_at"] is not None:
+        return False, f"Post {post_id} is already hidden."
+    if action == "restore" and row["moderated_at"] is None:
+        return False, f"Post {post_id} is not hidden."
+
+    stamp = now()
+    with conn:
+        if action == "hide":
+            conn.execute("""UPDATE board_posts
+                SET moderated_at = ?, moderated_by = ?, moderation_reason = ?
+                WHERE id = ?""", (stamp, actor_key, reason or None, post_id))
+        else:
+            conn.execute("""UPDATE board_posts
+                SET moderated_at = NULL, moderated_by = NULL, moderation_reason = NULL
+                WHERE id = ?""", (post_id,))
+        audit(conn, actor_key, f"{action}_board_post", str(post_id), reason)
+    return True, f"Post {post_id} {('hidden' if action == 'hide' else 'restored')}."
+
+
+def list_posts_for_moderation(conn, page=1, include_hidden=True):
+    """Return a compact newest-first post list for moderators."""
+    if page < 1:
+        return "Use ADMIN MOD LIST [page]."
+    where = "" if include_hidden else "WHERE p.moderated_at IS NULL"
+    total = conn.execute(
+        f"SELECT COUNT(*) FROM board_posts p {where}"
+    ).fetchone()[0]
+    pages = max(1, (total + MODERATION_PAGE_SIZE - 1) // MODERATION_PAGE_SIZE)
+    if page > pages:
+        return f"Posts: {total}. Use ADMIN MOD LIST 1-{pages}."
+    rows = conn.execute(f"""SELECT p.id, b.name AS board, u.display_name,
+        p.body, p.moderated_at
+        FROM board_posts p JOIN boards b ON b.id = p.board_id
+        JOIN users u ON u.public_key = p.author_key
+        {where} ORDER BY p.id DESC LIMIT ? OFFSET ?""",
+        (MODERATION_PAGE_SIZE, (page - 1) * MODERATION_PAGE_SIZE)).fetchall()
+    if not rows:
+        return "No board posts yet."
+    lines = [f"Moderation {page}/{pages} ({total} posts):"]
+    for row in rows:
+        state = "H" if row["moderated_at"] else "L"
+        board_name = row["board"][:12]
+        author_name = row["display_name"][:12]
+        preview = row["body"].replace("\n", " ")
+        if len(preview) > 15:
+            preview = preview[:14] + "…"
+        lines.append(f"#{row['id']} {state} {board_name}/{author_name}: {preview}")
+    if page < pages:
+        lines.append(f"More: ADMIN MOD LIST {page + 1}")
+    return radio_limit("\n".join(lines))
 
 
 def _chunks_utf8(text, budget):
