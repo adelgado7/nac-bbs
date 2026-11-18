@@ -5,7 +5,6 @@ import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from meshcore import MeshCore, EventType
 import mailbox_v1
 import boards_v1
 
@@ -1195,6 +1194,8 @@ def resolve_contact(
 # ---------------------------------------------------------
 
 async def main():
+    from meshcore import MeshCore, EventType
+
     init_db()
 
     print(f"[{stamp()}] Starting NAC-BBS")
@@ -1607,4 +1608,5 @@ async def main():
         )
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
