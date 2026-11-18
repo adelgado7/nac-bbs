@@ -551,7 +551,8 @@ def revoke_role(db_path, public_key):
         conn.close()
 
 
-def board_admin(db_path, action, name=None, description=""):
+def board_admin(db_path, action, name=None, description="",
+                author=None, message=""):
     """Manage public boards from the Pi's local terminal."""
     conn = connect_write(db_path)
     try:
@@ -576,6 +577,19 @@ def board_admin(db_path, action, name=None, description=""):
             if board_id is not None:
                 boards_v1.audit(conn, getpass.getuser(), "create_board",
                                 str(board_id), name)
+            return
+
+        if action == "post":
+            user = conn.execute("""SELECT public_key, display_name FROM users
+                WHERE display_name = ? COLLATE NOCASE OR public_key = ?""",
+                (author, author)).fetchone()
+            if user is None:
+                print("Author not found. Use a registered BBS name or full public key.")
+                return
+            reply = boards_v1.post_message(
+                conn, user["public_key"], name, message
+            )
+            print(f"As {user['display_name']}: {reply}")
             return
 
         status = "archived" if action == "archive" else "active"
@@ -656,6 +670,17 @@ def main():
     )
     create_board_parser.add_argument("name")
     create_board_parser.add_argument("--description", default="")
+    post_board_parser = board_actions.add_parser(
+        "post", help="Post to an active public board as a registered user"
+    )
+    post_board_parser.add_argument("name", help="Board name")
+    post_board_parser.add_argument(
+        "--author", required=True,
+        help="Registered BBS display name or complete public key",
+    )
+    post_board_parser.add_argument(
+        "--message", required=True, help="Public post text"
+    )
     for action in ("archive", "restore"):
         action_parser = board_actions.add_parser(
             action, help=f"{action.capitalize()} a board without deleting its posts"
@@ -689,6 +714,9 @@ def main():
             board_admin(args.db, "list")
         elif args.board_action == "create":
             board_admin(args.db, "create", args.name, args.description)
+        elif args.board_action == "post":
+            board_admin(args.db, "post", args.name,
+                        author=args.author, message=args.message)
         else:
             board_admin(args.db, args.board_action, args.name)
         return
