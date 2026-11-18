@@ -139,23 +139,31 @@ def _delete(conn, key, msg_id):
 
 def handle(text, key, user, get_db):
     """Return None for unrelated commands; otherwise a radio-sized response."""
-    parts = text.strip().split(None, 1)
+    parts = text.strip().split()
     if not parts:
         return None
     cmd = parts[0].upper()
+    mail_prefix = cmd == "MAIL" and len(parts) > 1
+    if mail_prefix:
+        cmd = parts[1].upper()
+        rest = " ".join(parts[2:])
+        if cmd == "COUNTS":
+            cmd = "MAIL"
+    else:
+        rest = " ".join(parts[1:])
     aliases = {"L":"LIST","LN":"NEW","R":"READ","K":"DELETE"}
     cmd = aliases.get(cmd,cmd)
     supported = {"MAIL","LIST","NEW","READ","REPLY","SENT","DELETE","KM"}
-    if cmd == "HELP" and len(parts)>1 and parts[1].strip().upper()=="MAIL":
-        return ("MAIL counts; LIST [page]; NEW [page]; READ [id] [part]; "
-                "REPLY <text> or REPLY <id> <text>; SENT [page]; "
-                "DELETE <id>; KM CONFIRM (delete read mail). "
-                "Shortcuts: L LN R K.")
+    if cmd == "HELP" and len(parts)>1 and parts[1].upper()=="MAIL":
+        return ("MAIL; LIST [p]; NEW [p]; READ [id] [part]; "
+                "REPLY [id] <text>; SENT [p]; DELETE <id>; "
+                "KM CONFIRM. Shortcuts: L LN R K.")
     if cmd not in supported:
+        if mail_prefix:
+            return "Unknown mail command. Send HELP MAIL."
         return None
     if not user:
         return "You are not registered. Use REGISTER <name> first."
-    rest = parts[1].strip() if len(parts)>1 else ""
     conn = get_db()
     try:
         if cmd == "MAIL":

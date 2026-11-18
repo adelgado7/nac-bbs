@@ -827,6 +827,18 @@ def _process_admin_board_command(text, public_key, conn):
         "ARCHIVE <name>, or RESTORE <name>."
     )
 
+
+def _is_superadmin(public_key, conn):
+    has_roles = conn.execute("""SELECT 1 FROM sqlite_master
+        WHERE type = 'table' AND name = 'admin_roles'""").fetchone()
+    if not has_roles:
+        return False
+    row = conn.execute(
+        "SELECT role FROM admin_roles WHERE public_key = ?",
+        (public_key,),
+    ).fetchone()
+    return bool(row and row["role"] == "superadmin")
+
 def process_command(
     text,
     public_key,
@@ -891,18 +903,9 @@ def process_command(
             conn.close()
 
     if upper.startswith("ADMIN BOARD"):
-        role = None
         conn = get_db()
         try:
-            has_roles = conn.execute("""SELECT 1 FROM sqlite_master
-                WHERE type = 'table' AND name = 'admin_roles'""").fetchone()
-            if has_roles:
-                row = conn.execute(
-                    "SELECT role FROM admin_roles WHERE public_key = ?",
-                    (public_key,),
-                ).fetchone()
-                role = row["role"] if row else None
-            if role != "superadmin":
+            if not _is_superadmin(public_key, conn):
                 return "Superadmin access required."
             return _process_admin_board_command(stripped, public_key, conn)
         finally:
@@ -939,35 +942,42 @@ def process_command(
 
         return "\n".join(lines)
 
-    if upper == "HELP":
-        lines = [
-            "NAC-BBS HELP\n"
-            "HELLO HELP ABOUT TIME WX BYE\n"
-            "REGISTER <name>\n"
-            "MAIL READ; HELP MAIL\n"
-            "SEND <name>|<message>\n"
-            "DIR [page] WHO <name>\n"
-            "PLAN [text|CLEAR]\n"
-            "BOARDS [page]; BOARD <name> [page]; BREAD <id> [part]\n"
-            "POST <board>|<message>"
-        ]
+    if upper in {"HELP", "HELP 1"}:
+        return (
+            "NAC-BBS HELP 1/2\n"
+            "HELLO ABOUT TIME WX BYE\n"
+            "REGISTER <name>; DIR [page]; WHO <name>\n"
+            "PLAN [text|CLEAR]; HELP 2"
+        )
+
+    if upper == "HELP 2":
+        return (
+            "NAC-BBS HELP 2/2\n"
+            "MAIL [READ|LIST|NEW|SENT]; SEND name|text\n"
+            "BOARDS; BOARD name [page]; POST name|text\n"
+            "BREAD id [part]; HELP MAIL; HELP BOARD"
+        )
+
+    if upper == "HELP BOARD":
+        return (
+            "BOARDS [page]; BOARD <name> [page];\n"
+            "POST <board>|<message>; BREAD <id> [part].\n"
+            "Posts are public. ADMIN BOARD for admin help."
+        )
+
+    if upper == "HELP ADMIN":
         conn = get_db()
         try:
-            has_roles = conn.execute("""SELECT 1 FROM sqlite_master
-                WHERE type = 'table' AND name = 'admin_roles'""").fetchone()
-            if has_roles:
-                row = conn.execute(
-                    "SELECT role FROM admin_roles WHERE public_key = ?",
-                    (public_key,),
-                ).fetchone()
-                if row and row["role"] == "superadmin":
-                    lines.append(
-                        "ADMIN BOARD CREATE <name>|<description>; "
-                        "LIST; ARCHIVE/RESTORE <name>"
-                    )
+            if not _is_superadmin(public_key, conn):
+                return "Superadmin access required."
+            return _process_admin_board_command(
+                "ADMIN BOARD HELP", public_key, conn
+            )
         finally:
             conn.close()
-        return "".join(lines)
+
+    if upper == "HELP":
+        return "Send HELP 1, HELP 2, HELP MAIL, or HELP BOARD."
 
     if upper == "BYE":
         return (
