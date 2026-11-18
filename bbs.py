@@ -947,22 +947,25 @@ def process_command(
             "NAC-BBS HELP 1/2\n"
             "HELLO ABOUT TIME WX BYE\n"
             "REGISTER <name>; DIR [page]; WHO <name>\n"
-            "PLAN [text|CLEAR]; HELP 2"
+            "PLAN [text|CLEAR]; HELP 2 (mail/boards)"
         )
 
     if upper == "HELP 2":
         return (
             "NAC-BBS HELP 2/2\n"
-            "MAIL [READ|LIST|NEW|SENT]; SEND name|text\n"
-            "BOARDS; BOARD name [page]; POST name|text\n"
-            "BREAD id [part]; HELP MAIL; HELP BOARD"
+            "MAIL [command]; SEND name|text\n"
+            "BOARDS [page]; BOARD <name> [page]\n"
+            "POST <board>|<text>; BREAD <id> [part]\n"
+            "HELP MAIL/BOARD"
         )
 
     if upper == "HELP BOARD":
         return (
-            "BOARDS [page]; BOARD <name> [page];\n"
-            "POST <board>|<message>; BREAD <id> [part].\n"
-            "Posts are public. ADMIN BOARD for admin help."
+            "BOARDS [page]: list.\n"
+            "BOARD <name> [page]: browse.\n"
+            "BREAD <id> [part]: read.\n"
+            "POST <board>|<text>: public post.\n"
+            "ADMIN BOARD: admin tools."
         )
 
     if upper == "HELP ADMIN":
