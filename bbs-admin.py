@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 import sqlite3
 from pathlib import Path
 
+import boards_v1
+
 DEFAULT_DB = Path.home() / "meshcore-bbs/bbs.db"
 
 
@@ -549,6 +551,44 @@ def revoke_role(db_path, public_key):
         conn.close()
 
 
+def board_admin(db_path, action, name=None, description=""):
+    """Manage public boards from the Pi's local terminal."""
+    conn = connect_write(db_path)
+    try:
+        boards_v1.ensure_schema(conn)
+        if action == "list":
+            rows = conn.execute("""SELECT name, description, status, created_at
+                FROM boards ORDER BY name COLLATE NOCASE""").fetchall()
+            if not rows:
+                print("No boards have been created.")
+                return
+            print(f"\n{'NAME':24} {'STATUS':10} DESCRIPTION")
+            print("-" * 72)
+            for row in rows:
+                print(f"{row['name'][:24]:24} {row['status']:10} {row['description']}")
+            return
+
+        if action == "create":
+            board_id, reply = boards_v1.create_board(
+                conn, name, description, created_by=None
+            )
+            print(reply)
+            if board_id is not None:
+                boards_v1.audit(conn, getpass.getuser(), "create_board",
+                                str(board_id), name)
+            return
+
+        status = "archived" if action == "archive" else "active"
+        changed, reply = boards_v1.set_board_status(conn, name, status)
+        print(reply)
+        if changed:
+            board = boards_v1.find_board(conn, name)
+            boards_v1.audit(conn, getpass.getuser(), f"{action}_board",
+                            str(board["id"]), board["name"])
+    finally:
+        conn.close()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="NAC-BBS administration utility"
@@ -604,6 +644,24 @@ def main():
     rename_parser.add_argument("public_key")
     rename_parser.add_argument("new_name")
 
+    board_parser = subparsers.add_parser(
+        "board", help="List, create, archive, or restore public boards"
+    )
+    board_actions = board_parser.add_subparsers(
+        dest="board_action", required=True
+    )
+    board_actions.add_parser("list", help="List boards and their status")
+    create_board_parser = board_actions.add_parser(
+        "create", help="Create a public board"
+    )
+    create_board_parser.add_argument("name")
+    create_board_parser.add_argument("--description", default="")
+    for action in ("archive", "restore"):
+        action_parser = board_actions.add_parser(
+            action, help=f"{action.capitalize()} a board without deleting its posts"
+        )
+        action_parser.add_argument("name")
+
     args = parser.parse_args()
 
     if args.command == "withdraw-consent":
@@ -624,6 +682,15 @@ def main():
 
     if args.command == "contact":
         update_contact(args.db, args.identifier)
+        return
+
+    if args.command == "board":
+        if args.board_action == "list":
+            board_admin(args.db, "list")
+        elif args.board_action == "create":
+            board_admin(args.db, "create", args.name, args.description)
+        else:
+            board_admin(args.db, args.board_action, args.name)
         return
 
     with connect(args.db) as conn:

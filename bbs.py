@@ -7,6 +7,7 @@ from pathlib import Path
 
 from meshcore import MeshCore, EventType
 import mailbox_v1
+import boards_v1
 
 
 DEVICE = (
@@ -156,6 +157,7 @@ def init_db():
     """)
 
     mailbox_v1.ensure_schema(conn)
+    boards_v1.ensure_schema(conn)
 
     conn.commit()
     conn.close()
@@ -782,6 +784,49 @@ def get_weather_summary():
 # Commands
 # ---------------------------------------------------------
 
+def _process_admin_board_command(text, public_key, conn):
+    """Run a board-management command after the role check succeeds."""
+    parts = text.split(None, 3)
+    if len(parts) < 3 or parts[2].upper() == "HELP":
+        return (
+            "ADMIN BOARD CREATE <name>|<description>; "
+            "LIST; ARCHIVE <name>; RESTORE <name>"
+        )
+
+    action = parts[2].upper()
+    remainder = parts[3].strip() if len(parts) > 3 else ""
+
+    if action == "LIST" and not remainder:
+        return boards_v1.list_boards(conn, include_archived=True)
+
+    if action == "CREATE":
+        if not remainder:
+            return "Usage: ADMIN BOARD CREATE <name>|<description>"
+        if "|" in remainder:
+            name, description = remainder.split("|", 1)
+        else:
+            name, description = remainder, ""
+        board_id, reply = boards_v1.create_board(
+            conn, name, description, created_by=public_key
+        )
+        if board_id is not None:
+            boards_v1.audit(conn, public_key, "create_board", str(board_id), name)
+        return reply
+
+    if action in {"ARCHIVE", "RESTORE"} and remainder:
+        status = "archived" if action == "ARCHIVE" else "active"
+        changed, reply = boards_v1.set_board_status(conn, remainder, status)
+        if changed:
+            board = boards_v1.find_board(conn, remainder)
+            boards_v1.audit(conn, public_key, f"{action.lower()}_board",
+                            str(board["id"]), board["name"])
+        return reply
+
+    return (
+        "Use ADMIN BOARD CREATE <name>|<description>, LIST, "
+        "ARCHIVE <name>, or RESTORE <name>."
+    )
+
 def process_command(
     text,
     public_key,
@@ -790,6 +835,78 @@ def process_command(
     stripped = text.strip()
     upper = stripped.upper()
     user = get_user_by_key(public_key)
+
+    if upper == "BOARDS" or upper.startswith("BOARDS "):
+        page_text = stripped[6:].strip() if upper != "BOARDS" else "1"
+        try:
+            page = int(page_text)
+        except ValueError:
+            return "Usage: BOARDS [page]"
+        conn = get_db()
+        try:
+            return boards_v1.list_boards(conn, page)
+        finally:
+            conn.close()
+
+    if upper.startswith("BOARD "):
+        board_arg = stripped[6:].strip()
+        page = 1
+        candidate = board_arg.rsplit(None, 1)
+        if len(candidate) == 2 and candidate[1].isdigit():
+            board_arg, page_text = candidate
+            page = int(page_text)
+        board_name = board_arg.strip()
+        if not board_name:
+            return "Usage: BOARD <name> [page]"
+        conn = get_db()
+        try:
+            return boards_v1.board_preview(conn, board_name, page)
+        finally:
+            conn.close()
+
+    if upper.startswith("BREAD"):
+        args = stripped.split()
+        if len(args) not in (2, 3) or not args[1].isdigit():
+            return "Usage: BREAD <post-id> [part]"
+        part = 1
+        if len(args) == 3:
+            if not args[2].isdigit():
+                return "Usage: BREAD <post-id> [part]"
+            part = int(args[2])
+        conn = get_db()
+        try:
+            return boards_v1.read_post(conn, int(args[1]), part)
+        finally:
+            conn.close()
+
+    if upper.startswith("POST "):
+        payload = stripped[5:].strip()
+        if "|" not in payload:
+            return "Usage: POST <board>|<message>"
+        board_name, body = payload.split("|", 1)
+        conn = get_db()
+        try:
+            return boards_v1.post_message(conn, public_key, board_name, body)
+        finally:
+            conn.close()
+
+    if upper.startswith("ADMIN BOARD"):
+        role = None
+        conn = get_db()
+        try:
+            has_roles = conn.execute("""SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'admin_roles'""").fetchone()
+            if has_roles:
+                row = conn.execute(
+                    "SELECT role FROM admin_roles WHERE public_key = ?",
+                    (public_key,),
+                ).fetchone()
+                role = row["role"] if row else None
+            if role != "superadmin":
+                return "Superadmin access required."
+            return _process_admin_board_command(stripped, public_key, conn)
+        finally:
+            conn.close()
 
     if upper in {"HELLO", "HI", "HEY"}:
         now = datetime.now()
@@ -823,15 +940,34 @@ def process_command(
         return "\n".join(lines)
 
     if upper == "HELP":
-        return (
+        lines = [
             "NAC-BBS HELP\n"
             "HELLO HELP ABOUT TIME WX BYE\n"
             "REGISTER <name>\n"
             "MAIL READ; HELP MAIL\n"
             "SEND <name>|<message>\n"
             "DIR [page] WHO <name>\n"
-            "PLAN [text|CLEAR]"
-        )
+            "PLAN [text|CLEAR]\n"
+            "BOARDS [page]; BOARD <name> [page]; BREAD <id> [part]\n"
+            "POST <board>|<message>"
+        ]
+        conn = get_db()
+        try:
+            has_roles = conn.execute("""SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'admin_roles'""").fetchone()
+            if has_roles:
+                row = conn.execute(
+                    "SELECT role FROM admin_roles WHERE public_key = ?",
+                    (public_key,),
+                ).fetchone()
+                if row and row["role"] == "superadmin":
+                    lines.append(
+                        "ADMIN BOARD CREATE <name>|<description>; "
+                        "LIST; ARCHIVE/RESTORE <name>"
+                    )
+        finally:
+            conn.close()
+        return "".join(lines)
 
     if upper == "BYE":
         return (
@@ -1423,7 +1559,8 @@ async def main():
     print(f"[{stamp()}] NAC-BBS is online.")
     print(
         "Commands: HELLO, HELP, ABOUT, TIME, WX, "
-        "REGISTER, MAIL, READ, SEND, DIR, WHO, PLAN, BYE"
+        "REGISTER, MAIL, READ, SEND, DIR, WHO, PLAN, "
+        "BOARDS, BOARD, BREAD, POST, BYE"
     )
     print("Scheduled flood adverts: :00 and :30 each hour.")
     print(
