@@ -1465,7 +1465,8 @@ async def main():
         print(f"[{stamp()}] DIRECT MESSAGE")
         print(f"From: {sender_prefix}")
         print(f"SNR:  {snr}")
-        print(f"Message length: {len(text.encode('utf-8'))} bytes (content omitted)")
+        message_bytes = len(text.encode("utf-8"))
+        print(f"Message length: {message_bytes} bytes (content omitted)")
         print("----------------------------------------")
 
         public_key, contact = resolve_contact(
