@@ -1465,7 +1465,7 @@ async def main():
         print(f"[{stamp()}] DIRECT MESSAGE")
         print(f"From: {sender_prefix}")
         print(f"SNR:  {snr}")
-        print(f"Text: {text}")
+        print(f"Message length: {len(text.encode('utf-8'))} bytes (content omitted)")
         print("----------------------------------------")
 
         public_key, contact = resolve_contact(
@@ -1525,7 +1525,7 @@ async def main():
         )
 
         print(
-            f"[{stamp()}] Replying: {reply}"
+            f"[{stamp()}] Reply prepared ({len(reply.encode('utf-8'))} bytes; content omitted)."
         )
 
         send_result = (
@@ -1539,7 +1539,7 @@ async def main():
             print(
                 f"[{stamp()}] ERROR sending reply:"
             )
-            print(send_result.payload)
+            print(f"[{stamp()}] Message send failed (payload omitted to protect message content).")
         else:
             print(
                 f"[{stamp()}] Reply queued successfully."
