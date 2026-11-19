@@ -162,7 +162,7 @@ def init_db():
     conn.close()
 
 
-def store_incoming_message(sender_key, message, snr):
+def store_incoming_message(sender_key, snr):
     conn = get_db()
 
     conn.execute(
@@ -180,7 +180,7 @@ def store_incoming_message(sender_key, message, snr):
                 timespec="seconds"
             ),
             sender_key,
-            message,
+            "[REDACTED]",
             snr,
         ),
     )
@@ -1506,9 +1506,9 @@ async def main():
             snr=snr,
         )
 
+        # Store reception metadata only, never the incoming command or mail body.
         store_incoming_message(
             public_key,
-            text,
             snr,
         )
 
