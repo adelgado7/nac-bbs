@@ -1524,8 +1524,10 @@ async def main():
             advertised_name,
         )
 
+        reply_bytes = len(reply.encode("utf-8"))
         print(
-            f"[{stamp()}] Reply prepared ({len(reply.encode('utf-8'))} bytes; content omitted)."
+            f"[{stamp()}] Reply prepared: {reply_bytes} bytes "
+            "(content omitted)."
         )
 
         send_result = (
@@ -1539,7 +1541,10 @@ async def main():
             print(
                 f"[{stamp()}] ERROR sending reply:"
             )
-            print(f"[{stamp()}] Message send failed (payload omitted to protect message content).")
+            print(
+                f"[{stamp()}] Send error payload omitted "
+                "to protect message content."
+            )
         else:
             print(
                 f"[{stamp()}] Reply queued successfully."
