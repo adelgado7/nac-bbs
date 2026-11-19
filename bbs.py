@@ -1376,6 +1376,11 @@ async def main():
         f"{result.payload.get('adv_lon')}"
     )
 
+    print(
+        f"[{stamp()}] Advert location policy: "
+        f"{result.payload.get('adv_loc_policy', 'Unknown')}"
+    )
+
     contacts_result = (
         await meshcore.commands.get_contacts()
     )
