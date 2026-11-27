@@ -1,4 +1,4 @@
-# NAC-BBS email notifications
+# NAC-BBS email and chat notifications
 
 NAC-BBS queues email alerts for first-time registrations and new BBSMail addressed
 to the registered user **Andy Delgado**. The queue is stored in the BBS SQLite
