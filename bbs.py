@@ -7,6 +7,8 @@ from pathlib import Path
 
 import mailbox_v1
 import boards_v1
+import email_notifications
+import chat_notifications
 
 
 DEVICE = (
@@ -26,8 +28,8 @@ COURTESY_ADVERT_COOLDOWN_SECONDS = 30 * 60
 COURTESY_ADVERT_DELAY_SECONDS = 1.0
 MESHCORE_CLIENT_TYPE = 1
 
-# Community directory behavior.
-DIR_PAGE_SIZE = 10
+# Community directory replies are kept within the radio payload budget.
+DIR_REPLY_MAX_BYTES = 140
 PLAN_MAX_LENGTH = 120
 
 
@@ -157,6 +159,8 @@ def init_db():
 
     mailbox_v1.ensure_schema(conn)
     boards_v1.ensure_schema(conn)
+    email_notifications.ensure_schema(conn)
+    chat_notifications.ensure_schema(conn)
 
     conn.commit()
     conn.close()
@@ -417,6 +421,11 @@ def register_user(
 
         action = "registered"
 
+    if action == "registered":
+        email_notifications.enqueue_registration(
+            conn, public_key, display_name, now
+        )
+
     conn.commit()
     conn.close()
 
@@ -427,36 +436,55 @@ def register_user(
 
 
 def get_directory_page(page=1):
-    """Return one alphabetized page of registered mailbox names."""
+    """Return an alphabetized directory page that fits a radio reply."""
     conn = get_db()
-
-    total = conn.execute(
-        "SELECT COUNT(*) AS count FROM users"
-    ).fetchone()["count"]
-
-    total_pages = max(
-        1,
-        (total + DIR_PAGE_SIZE - 1) // DIR_PAGE_SIZE,
-    )
-
-    if page < 1 or page > total_pages:
-        conn.close()
-        return None, total, total_pages
-
-    offset = (page - 1) * DIR_PAGE_SIZE
-
     rows = conn.execute(
         """
         SELECT display_name
         FROM users
         ORDER BY display_name COLLATE NOCASE
-        LIMIT ? OFFSET ?
-        """,
-        (DIR_PAGE_SIZE, offset),
+        """
     ).fetchall()
-
     conn.close()
-    return rows, total, total_pages
+
+    total = len(rows)
+    max_page_number = max(total, 1)
+    header = (
+        "NAC-BBS Mailbox Directory\n"
+        f"Page {max_page_number} of {max_page_number} "
+        f"- {total} registered"
+    )
+    header_budget = len(header.encode("utf-8"))
+    footer_budget = (
+        len(f"Use DIR {max_page_number} for more.".encode("utf-8"))
+        if total > 1 else 0
+    )
+    content_budget = max(
+        1,
+        DIR_REPLY_MAX_BYTES - header_budget - footer_budget - 2,
+    )
+
+    pages = [[]]
+    page_bytes = 0
+    for number, row in enumerate(rows, start=1):
+        name = row["display_name"]
+        entry = (number, name)
+        entry_bytes = len(f"{number}. {name}".encode("utf-8"))
+        extra_bytes = entry_bytes + (1 if pages[-1] else 0)
+
+        if pages[-1] and page_bytes + extra_bytes > content_budget:
+            pages.append([])
+            page_bytes = 0
+            extra_bytes = entry_bytes
+
+        pages[-1].append(entry)
+        page_bytes += extra_bytes
+
+    total_pages = len(pages)
+    if page < 1 or page > total_pages:
+        return None, total, total_pages
+
+    return pages[page - 1], total, total_pages
 
 
 def directory_reply(page=1):
@@ -473,15 +501,16 @@ def directory_reply(page=1):
         f"Page {page} of {total_pages} - {total} registered",
     ]
 
-    start_number = ((page - 1) * DIR_PAGE_SIZE) + 1
+    for index, display_name in rows:
+        lines.append(f"{index}. {display_name}")
 
-    for index, row in enumerate(rows, start=start_number):
-        lines.append(f"{index}. {row['display_name']}")
+    if page < total_pages:
+        lines.append(f"Use DIR {page + 1} for more.")
 
-    if total_pages > 1:
-        lines.append("Use DIR <page> for more.")
-
-    return "\n".join(lines)
+    return boards_v1.radio_limit(
+        "\n".join(lines),
+        DIR_REPLY_MAX_BYTES,
+    )
 
 
 def set_user_plan(public_key, plan):
@@ -594,8 +623,17 @@ def mailbox_status(public_key):
 
 def store_mail(sender_key, recipient_key, message):
     conn = get_db()
+    created_at = datetime.now().astimezone().isoformat(
+        timespec="seconds"
+    )
+    unread_before = conn.execute(
+        """SELECT COUNT(*) FROM mail
+           WHERE recipient_key=? AND read_at IS NULL
+             AND deleted_at IS NULL""",
+        (recipient_key,),
+    ).fetchone()[0]
 
-    conn.execute(
+    cursor = conn.execute(
         """
         INSERT INTO mail (
             sender_key,
@@ -605,15 +643,28 @@ def store_mail(sender_key, recipient_key, message):
         )
         VALUES (?, ?, ?, ?)
         """,
-        (
-            sender_key,
-            recipient_key,
-            message,
-            datetime.now().astimezone().isoformat(
-                timespec="seconds"
-            ),
-        ),
+        (sender_key, recipient_key, message, created_at),
     )
+    mail_id = cursor.lastrowid
+
+    recipient = conn.execute(
+        "SELECT display_name FROM users WHERE public_key = ?",
+        (recipient_key,),
+    ).fetchone()
+    if recipient and recipient["display_name"].casefold() == "andy delgado":
+        sender = conn.execute(
+            "SELECT display_name FROM users WHERE public_key = ?",
+            (sender_key,),
+        ).fetchone()
+        sender_name = sender["display_name"] if sender else "Unknown sender"
+        email_notifications.enqueue_mail_arrival(
+            conn, mail_id, sender_name, created_at
+        )
+
+    if unread_before == 0:
+        chat_notifications.enqueue_unread_notice(
+            conn, mail_id, recipient_key, created_at
+        )
 
     conn.commit()
     conn.close()
@@ -961,6 +1012,51 @@ def _process_admin_role_command(text, public_key, conn):
 
     return "Use ADMIN ROLE LIST [page], GRANT <name>|sysop, or REVOKE <name>."
 
+def _process_admin_notify_command(text, public_key, conn):
+    """Show or change the notification switches."""
+    parts = text.split()
+    if len(parts) == 3 and parts[2].upper() == "STATUS":
+        status = email_notifications.settings_status(conn)
+        return (
+            "Notifications: "
+            f"MAIL={'ON' if status[email_notifications.KIND_MAIL] else 'OFF'}, "
+            f"REGISTRATION={'ON' if status[email_notifications.KIND_REGISTRATION] else 'OFF'}, "
+            f"CHAT={'ON' if status[email_notifications.KIND_CHAT] else 'OFF'}."
+        )
+
+    if len(parts) != 4:
+        return (
+            "Use ADMIN NOTIFY STATUS, MAIL ON|OFF, "
+            "REGISTRATION ON|OFF, or CHAT ON|OFF."
+        )
+
+    kind_name = parts[2].upper()
+    value = parts[3].upper()
+    kinds = {
+        "MAIL": email_notifications.KIND_MAIL,
+        "REGISTRATION": email_notifications.KIND_REGISTRATION,
+        "CHAT": email_notifications.KIND_CHAT,
+    }
+    kind = kinds.get(kind_name)
+    if kind is None or value not in {"ON", "OFF"}:
+        return (
+            "Use ADMIN NOTIFY STATUS, MAIL ON|OFF, "
+            "REGISTRATION ON|OFF, or CHAT ON|OFF."
+        )
+
+    enabled = value == "ON"
+    email_notifications.set_enabled(conn, kind, enabled, public_key)
+    boards_v1.audit(
+        conn,
+        public_key,
+        "set_notification",
+        kind,
+        value.lower(),
+    )
+    label = "chat notifications" if kind_name == "CHAT" else "email alerts"
+    return f"{kind_name} {label} turned {value.lower()}."
+
+
 def process_command(
     text,
     public_key,
@@ -1030,6 +1126,17 @@ def process_command(
             if not _is_superadmin(public_key, conn):
                 return "Superadmin access required."
             return _process_admin_board_command(stripped, public_key, conn)
+        finally:
+            conn.close()
+
+    if upper.startswith("ADMIN NOTIFY"):
+        conn = get_db()
+        try:
+            if not _is_superadmin(public_key, conn):
+                return "Superadmin access required."
+            return _process_admin_notify_command(
+                stripped, public_key, conn
+            )
         finally:
             conn.close()
 
@@ -1122,7 +1229,11 @@ def process_command(
         try:
             if not _is_superadmin(public_key, conn):
                 return "Superadmin access required."
-            return "ADMIN ROLE LIST; GRANT name|sysop; REVOKE name. ADMIN BOARD HELP."
+            return (
+                "ADMIN ROLE LIST; GRANT name|sysop; REVOKE name. "
+                "ADMIN NOTIFY STATUS/MAIL ON|OFF/REGISTRATION ON|OFF/"
+                "CHAT ON|OFF; ADMIN BOARD HELP."
+            )
         finally:
             conn.close()
 
@@ -1410,6 +1521,85 @@ async def main():
 
         if result.type != EventType.ERROR:
             contacts = result.payload
+
+    async def chat_notification_worker():
+        """Send queued private inbox notices over MeshCore."""
+        while True:
+            item = await asyncio.to_thread(
+                chat_notifications.next_pending, DB_FILE
+            )
+            if item is None:
+                await asyncio.sleep(chat_notifications.POLL_SECONDS)
+                continue
+
+            if not await asyncio.to_thread(
+                chat_notifications.is_enabled, DB_FILE
+            ):
+                await asyncio.to_thread(
+                    chat_notifications.mark_suppressed,
+                    DB_FILE,
+                    item["id"],
+                )
+                continue
+
+            contact = contacts.get(item["recipient_key"])
+            if not contact:
+                await refresh_contacts()
+                contact = contacts.get(item["recipient_key"])
+
+            if not contact:
+                await asyncio.to_thread(
+                    chat_notifications.mark_failed,
+                    DB_FILE,
+                    item["id"],
+                    item["attempts"] + 1,
+                    "recipient contact unavailable",
+                )
+                print(
+                    f"[{stamp()}] Chat notification {item['id']} "
+                    "queued; recipient contact unavailable."
+                )
+                continue
+
+            try:
+                result = await meshcore.commands.send_msg(
+                    contact,
+                    item["message"],
+                )
+                if result.type == EventType.ERROR:
+                    await asyncio.to_thread(
+                        chat_notifications.mark_failed,
+                        DB_FILE,
+                        item["id"],
+                        item["attempts"] + 1,
+                        "radio send returned an error",
+                    )
+                    print(
+                        f"[{stamp()}] Chat notification {item['id']} "
+                        "send failed; retry scheduled."
+                    )
+                else:
+                    await asyncio.to_thread(
+                        chat_notifications.mark_sent,
+                        DB_FILE,
+                        item["id"],
+                    )
+                    print(
+                        f"[{stamp()}] Chat notification {item['id']} "
+                        "queued for radio delivery."
+                    )
+            except Exception as exc:
+                await asyncio.to_thread(
+                    chat_notifications.mark_failed,
+                    DB_FILE,
+                    item["id"],
+                    item["attempts"] + 1,
+                    type(exc).__name__,
+                )
+                print(
+                    f"[{stamp()}] Chat notification {item['id']} "
+                    "send failed; retry scheduled."
+                )
 
     async def scheduled_advertisements():
         while True:
@@ -1727,6 +1917,12 @@ async def main():
     advert_task = asyncio.create_task(
         scheduled_advertisements()
     )
+    notification_task = asyncio.create_task(
+        email_notifications.run_worker(DB_FILE)
+    )
+    chat_notification_task = asyncio.create_task(
+        chat_notification_worker()
+    )
 
     print()
     print(f"[{stamp()}] NAC-BBS is online.")
@@ -1753,11 +1949,18 @@ async def main():
 
     finally:
         advert_task.cancel()
+        notification_task.cancel()
+        chat_notification_task.cancel()
 
-        try:
-            await advert_task
-        except asyncio.CancelledError:
-            pass
+        for task in (
+            advert_task,
+            notification_task,
+            chat_notification_task,
+        ):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
         await meshcore.stop_auto_message_fetching()
         await meshcore.disconnect()

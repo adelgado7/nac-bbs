@@ -2,6 +2,9 @@
 from datetime import datetime
 import sqlite3
 
+import email_notifications
+import chat_notifications
+
 PAGE_SIZE = 5
 MAX_MESSAGE = 500
 READ_REPLY_MAX_BYTES = 140  # Conservative; verify on actual MeshCore radio.
@@ -125,8 +128,32 @@ def _reply(conn, key, rest):
             WHERE id=? AND recipient_key=? AND deleted_at IS NULL""", (msg_id,key)).fetchone()
         if row is None:
             return "Message not found in your inbox."
-        conn.execute("""INSERT INTO mail(sender_key,recipient_key,message,created_at)
-            VALUES (?,?,?,?)""", (key,row["sender_key"],body,now()))
+        created_at = now()
+        unread_before = conn.execute(
+            """SELECT COUNT(*) FROM mail
+               WHERE recipient_key=? AND read_at IS NULL
+                 AND deleted_at IS NULL""",
+            (row["sender_key"],),
+        ).fetchone()[0]
+        cursor = conn.execute("""INSERT INTO mail(sender_key,recipient_key,message,created_at)
+            VALUES (?,?,?,?)""", (key,row["sender_key"],body,created_at))
+        recipient = conn.execute(
+            "SELECT display_name FROM users WHERE public_key=?",
+            (row["sender_key"],),
+        ).fetchone()
+        if recipient and recipient["display_name"].casefold() == "andy delgado":
+            sender = conn.execute(
+                "SELECT display_name FROM users WHERE public_key=?",
+                (key,),
+            ).fetchone()
+            sender_name = sender["display_name"] if sender else "Unknown sender"
+            email_notifications.enqueue_mail_arrival(
+                conn, cursor.lastrowid, sender_name, created_at
+            )
+        if unread_before == 0:
+            chat_notifications.enqueue_unread_notice(
+                conn, cursor.lastrowid, row["sender_key"], created_at
+            )
     return f"Reply saved to sender of message {msg_id}."
 
 
