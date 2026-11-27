@@ -459,7 +459,7 @@ def get_directory_page(page=1):
     )
     content_budget = max(
         1,
-        140 - header_budget - footer_budget - 2,
+        DIR_REPLY_MAX_BYTES - header_budget - footer_budget - 2,
     )
 
     pages = [[]]
