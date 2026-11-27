@@ -434,36 +434,54 @@ def register_user(
 
 
 def get_directory_page(page=1):
-    """Return one alphabetized page of registered mailbox names."""
+    """Return an alphabetized directory page that fits a radio reply."""
     conn = get_db()
-
-    total = conn.execute(
-        "SELECT COUNT(*) AS count FROM users"
-    ).fetchone()["count"]
-
-    total_pages = max(
-        1,
-        (total + DIR_PAGE_SIZE - 1) // DIR_PAGE_SIZE,
-    )
-
-    if page < 1 or page > total_pages:
-        conn.close()
-        return None, total, total_pages
-
-    offset = (page - 1) * DIR_PAGE_SIZE
-
     rows = conn.execute(
         """
         SELECT display_name
         FROM users
         ORDER BY display_name COLLATE NOCASE
-        LIMIT ? OFFSET ?
-        """,
-        (DIR_PAGE_SIZE, offset),
+        """
     ).fetchall()
-
     conn.close()
-    return rows, total, total_pages
+
+    total = len(rows)
+    max_page_number = max(total, 1)
+    header_budget = len(
+        "NAC-BBS Mailbox Directory\n"
+        f"Page {max_page_number} of {max_page_number} "
+        f"- {total} registered"
+    .encode("utf-8"))
+    footer_budget = (
+        len(f"Use DIR {max_page_number} for more.".encode("utf-8"))
+        if total > 1 else 0
+    )
+    content_budget = max(
+        1,
+        140 - header_budget - footer_budget - 2,
+    )
+
+    pages = [[]]
+    page_bytes = 0
+    for number, row in enumerate(rows, start=1):
+        name = row["display_name"]
+        entry = (number, name)
+        entry_bytes = len(f"{number}. {name}".encode("utf-8"))
+        extra_bytes = entry_bytes + (1 if pages[-1] else 0)
+
+        if pages[-1] and page_bytes + extra_bytes > content_budget:
+            pages.append([])
+            page_bytes = 0
+            extra_bytes = entry_bytes
+
+        pages[-1].append(entry)
+        page_bytes += extra_bytes
+
+    total_pages = len(pages)
+    if page < 1 or page > total_pages:
+        return None, total, total_pages
+
+    return pages[page - 1], total, total_pages
 
 
 def directory_reply(page=1):
@@ -480,13 +498,11 @@ def directory_reply(page=1):
         f"Page {page} of {total_pages} - {total} registered",
     ]
 
-    start_number = ((page - 1) * DIR_PAGE_SIZE) + 1
+    for index, display_name in rows:
+        lines.append(f"{index}. {display_name}")
 
-    for index, row in enumerate(rows, start=start_number):
-        lines.append(f"{index}. {row['display_name']}")
-
-    if total_pages > 1:
-        lines.append("Use DIR <page> for more.")
+    if page < total_pages:
+        lines.append(f"Use DIR {page + 1} for more.")
 
     return "\n".join(lines)
 
