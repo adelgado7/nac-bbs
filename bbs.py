@@ -8,6 +8,7 @@ from pathlib import Path
 import mailbox_v1
 import boards_v1
 import email_notifications
+import chat_notifications
 
 
 DEVICE = (
@@ -159,6 +160,7 @@ def init_db():
     mailbox_v1.ensure_schema(conn)
     boards_v1.ensure_schema(conn)
     email_notifications.ensure_schema(conn)
+    chat_notifications.ensure_schema(conn)
 
     conn.commit()
     conn.close()
@@ -624,6 +626,12 @@ def store_mail(sender_key, recipient_key, message):
     created_at = datetime.now().astimezone().isoformat(
         timespec="seconds"
     )
+    unread_before = conn.execute(
+        """SELECT COUNT(*) FROM mail
+           WHERE recipient_key=? AND read_at IS NULL
+             AND deleted_at IS NULL""",
+        (recipient_key,),
+    ).fetchone()[0]
 
     cursor = conn.execute(
         """
@@ -651,6 +659,11 @@ def store_mail(sender_key, recipient_key, message):
         sender_name = sender["display_name"] if sender else "Unknown sender"
         email_notifications.enqueue_mail_arrival(
             conn, mail_id, sender_name, created_at
+        )
+
+    if unread_before == 0:
+        chat_notifications.enqueue_unread_notice(
+            conn, mail_id, recipient_key, created_at
         )
 
     conn.commit()
@@ -1007,13 +1020,14 @@ def _process_admin_notify_command(text, public_key, conn):
         return (
             "Email alerts: "
             f"MAIL={'ON' if status[email_notifications.KIND_MAIL] else 'OFF'}, "
-            f"REGISTRATION={'ON' if status[email_notifications.KIND_REGISTRATION] else 'OFF'}."
+            f"REGISTRATION={'ON' if status[email_notifications.KIND_REGISTRATION] else 'OFF'}, "
+            f"CHAT={'ON' if status[email_notifications.KIND_CHAT] else 'OFF'}."
         )
 
     if len(parts) != 4:
         return (
-            "Use ADMIN NOTIFY STATUS, "
-            "MAIL ON|OFF, or REGISTRATION ON|OFF."
+            "Use ADMIN NOTIFY STATUS, MAIL ON|OFF, "
+            "REGISTRATION ON|OFF, or CHAT ON|OFF."
         )
 
     kind_name = parts[2].upper()
@@ -1021,12 +1035,13 @@ def _process_admin_notify_command(text, public_key, conn):
     kinds = {
         "MAIL": email_notifications.KIND_MAIL,
         "REGISTRATION": email_notifications.KIND_REGISTRATION,
+        "CHAT": email_notifications.KIND_CHAT,
     }
     kind = kinds.get(kind_name)
     if kind is None or value not in {"ON", "OFF"}:
         return (
-            "Use ADMIN NOTIFY STATUS, "
-            "MAIL ON|OFF, or REGISTRATION ON|OFF."
+            "Use ADMIN NOTIFY STATUS, MAIL ON|OFF, "
+            "REGISTRATION ON|OFF, or CHAT ON|OFF."
         )
 
     enabled = value == "ON"
@@ -1215,8 +1230,8 @@ def process_command(
                 return "Superadmin access required."
             return (
                 "ADMIN ROLE LIST; GRANT name|sysop; REVOKE name. "
-                "ADMIN NOTIFY STATUS/MAIL ON|OFF/REGISTRATION ON|OFF; "
-                "ADMIN BOARD HELP."
+                "ADMIN NOTIFY STATUS/MAIL ON|OFF/REGISTRATION ON|OFF/"
+                "CHAT ON|OFF; ADMIN BOARD HELP."
             )
         finally:
             conn.close()
@@ -1505,6 +1520,85 @@ async def main():
 
         if result.type != EventType.ERROR:
             contacts = result.payload
+
+    async def chat_notification_worker():
+        """Send queued private inbox notices over MeshCore."""
+        while True:
+            item = await asyncio.to_thread(
+                chat_notifications.next_pending, DB_FILE
+            )
+            if item is None:
+                await asyncio.sleep(chat_notifications.POLL_SECONDS)
+                continue
+
+            if not await asyncio.to_thread(
+                chat_notifications.is_enabled, DB_FILE
+            ):
+                await asyncio.to_thread(
+                    chat_notifications.mark_suppressed,
+                    DB_FILE,
+                    item["id"],
+                )
+                continue
+
+            contact = contacts.get(item["recipient_key"])
+            if not contact:
+                await refresh_contacts()
+                contact = contacts.get(item["recipient_key"])
+
+            if not contact:
+                await asyncio.to_thread(
+                    chat_notifications.mark_failed,
+                    DB_FILE,
+                    item["id"],
+                    item["attempts"] + 1,
+                    "recipient contact unavailable",
+                )
+                print(
+                    f"[{stamp()}] Chat notification {item['id']} "
+                    "queued; recipient contact unavailable."
+                )
+                continue
+
+            try:
+                result = await meshcore.commands.send_msg(
+                    contact,
+                    item["message"],
+                )
+                if result.type == EventType.ERROR:
+                    await asyncio.to_thread(
+                        chat_notifications.mark_failed,
+                        DB_FILE,
+                        item["id"],
+                        item["attempts"] + 1,
+                        "radio send returned an error",
+                    )
+                    print(
+                        f"[{stamp()}] Chat notification {item['id']} "
+                        "send failed; retry scheduled."
+                    )
+                else:
+                    await asyncio.to_thread(
+                        chat_notifications.mark_sent,
+                        DB_FILE,
+                        item["id"],
+                    )
+                    print(
+                        f"[{stamp()}] Chat notification {item['id']} "
+                        "queued for radio delivery."
+                    )
+            except Exception as exc:
+                await asyncio.to_thread(
+                    chat_notifications.mark_failed,
+                    DB_FILE,
+                    item["id"],
+                    item["attempts"] + 1,
+                    type(exc).__name__,
+                )
+                print(
+                    f"[{stamp()}] Chat notification {item['id']} "
+                    "send failed; retry scheduled."
+                )
 
     async def scheduled_advertisements():
         while True:
@@ -1825,6 +1919,9 @@ async def main():
     notification_task = asyncio.create_task(
         email_notifications.run_worker(DB_FILE)
     )
+    chat_notification_task = asyncio.create_task(
+        chat_notification_worker()
+    )
 
     print()
     print(f"[{stamp()}] NAC-BBS is online.")
@@ -1852,8 +1949,13 @@ async def main():
     finally:
         advert_task.cancel()
         notification_task.cancel()
+        chat_notification_task.cancel()
 
-        for task in (advert_task, notification_task):
+        for task in (
+            advert_task,
+            notification_task,
+            chat_notification_task,
+        ):
             try:
                 await task
             except asyncio.CancelledError:
