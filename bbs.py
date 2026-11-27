@@ -505,7 +505,10 @@ def directory_reply(page=1):
     if page < total_pages:
         lines.append(f"Use DIR {page + 1} for more.")
 
-    return "\n".join(lines)
+    return boards_v1.radio_limit(
+        "\n".join(lines),
+        DIR_REPLY_MAX_BYTES,
+    )
 
 
 def set_user_plan(public_key, plan):
