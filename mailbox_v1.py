@@ -3,6 +3,7 @@ from datetime import datetime
 import sqlite3
 
 import email_notifications
+import chat_notifications
 
 PAGE_SIZE = 5
 MAX_MESSAGE = 500
@@ -128,6 +129,12 @@ def _reply(conn, key, rest):
         if row is None:
             return "Message not found in your inbox."
         created_at = now()
+        unread_before = conn.execute(
+            """SELECT COUNT(*) FROM mail
+               WHERE recipient_key=? AND read_at IS NULL
+                 AND deleted_at IS NULL""",
+            (row["sender_key"],),
+        ).fetchone()[0]
         cursor = conn.execute("""INSERT INTO mail(sender_key,recipient_key,message,created_at)
             VALUES (?,?,?,?)""", (key,row["sender_key"],body,created_at))
         recipient = conn.execute(
@@ -142,6 +149,10 @@ def _reply(conn, key, rest):
             sender_name = sender["display_name"] if sender else "Unknown sender"
             email_notifications.enqueue_mail_arrival(
                 conn, cursor.lastrowid, sender_name, created_at
+            )
+        if unread_before == 0:
+            chat_notifications.enqueue_unread_notice(
+                conn, cursor.lastrowid, row["sender_key"], created_at
             )
     return f"Reply saved to sender of message {msg_id}."
 
