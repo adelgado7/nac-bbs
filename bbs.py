@@ -1013,12 +1013,12 @@ def _process_admin_role_command(text, public_key, conn):
     return "Use ADMIN ROLE LIST [page], GRANT <name>|sysop, or REVOKE <name>."
 
 def _process_admin_notify_command(text, public_key, conn):
-    """Show or change the email notification switches."""
+    """Show or change the notification switches."""
     parts = text.split()
     if len(parts) == 3 and parts[2].upper() == "STATUS":
         status = email_notifications.settings_status(conn)
         return (
-            "Email alerts: "
+            "Notifications: "
             f"MAIL={'ON' if status[email_notifications.KIND_MAIL] else 'OFF'}, "
             f"REGISTRATION={'ON' if status[email_notifications.KIND_REGISTRATION] else 'OFF'}, "
             f"CHAT={'ON' if status[email_notifications.KIND_CHAT] else 'OFF'}."
