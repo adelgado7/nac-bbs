@@ -7,6 +7,7 @@ from pathlib import Path
 
 import mailbox_v1
 import boards_v1
+import email_notifications
 
 
 DEVICE = (
@@ -157,6 +158,7 @@ def init_db():
 
     mailbox_v1.ensure_schema(conn)
     boards_v1.ensure_schema(conn)
+    email_notifications.ensure_schema(conn)
 
     conn.commit()
     conn.close()
@@ -417,6 +419,11 @@ def register_user(
 
         action = "registered"
 
+    if action == "registered":
+        email_notifications.enqueue_registration(
+            conn, public_key, display_name, now
+        )
+
     conn.commit()
     conn.close()
 
@@ -594,8 +601,11 @@ def mailbox_status(public_key):
 
 def store_mail(sender_key, recipient_key, message):
     conn = get_db()
+    created_at = datetime.now().astimezone().isoformat(
+        timespec="seconds"
+    )
 
-    conn.execute(
+    cursor = conn.execute(
         """
         INSERT INTO mail (
             sender_key,
@@ -605,15 +615,23 @@ def store_mail(sender_key, recipient_key, message):
         )
         VALUES (?, ?, ?, ?)
         """,
-        (
-            sender_key,
-            recipient_key,
-            message,
-            datetime.now().astimezone().isoformat(
-                timespec="seconds"
-            ),
-        ),
+        (sender_key, recipient_key, message, created_at),
     )
+    mail_id = cursor.lastrowid
+
+    recipient = conn.execute(
+        "SELECT display_name FROM users WHERE public_key = ?",
+        (recipient_key,),
+    ).fetchone()
+    if recipient and recipient["display_name"].casefold() == "andy delgado":
+        sender = conn.execute(
+            "SELECT display_name FROM users WHERE public_key = ?",
+            (sender_key,),
+        ).fetchone()
+        sender_name = sender["display_name"] if sender else "Unknown sender"
+        email_notifications.enqueue_mail_arrival(
+            conn, mail_id, sender_name, created_at
+        )
 
     conn.commit()
     conn.close()
@@ -961,6 +979,48 @@ def _process_admin_role_command(text, public_key, conn):
 
     return "Use ADMIN ROLE LIST [page], GRANT <name>|sysop, or REVOKE <name>."
 
+def _process_admin_notify_command(text, public_key, conn):
+    """Show or change the email notification switches."""
+    parts = text.split()
+    if len(parts) == 3 and parts[2].upper() == "STATUS":
+        status = email_notifications.settings_status(conn)
+        return (
+            "Email alerts: "
+            f"MAIL={'ON' if status[email_notifications.KIND_MAIL] else 'OFF'}, "
+            f"REGISTRATION={'ON' if status[email_notifications.KIND_REGISTRATION] else 'OFF'}."
+        )
+
+    if len(parts) != 4:
+        return (
+            "Use ADMIN NOTIFY STATUS, "
+            "MAIL ON|OFF, or REGISTRATION ON|OFF."
+        )
+
+    kind_name = parts[2].upper()
+    value = parts[3].upper()
+    kinds = {
+        "MAIL": email_notifications.KIND_MAIL,
+        "REGISTRATION": email_notifications.KIND_REGISTRATION,
+    }
+    kind = kinds.get(kind_name)
+    if kind is None or value not in {"ON", "OFF"}:
+        return (
+            "Use ADMIN NOTIFY STATUS, "
+            "MAIL ON|OFF, or REGISTRATION ON|OFF."
+        )
+
+    enabled = value == "ON"
+    email_notifications.set_enabled(conn, kind, enabled, public_key)
+    boards_v1.audit(
+        conn,
+        public_key,
+        "set_email_notification",
+        kind,
+        value.lower(),
+    )
+    return f"{kind_name} email alerts turned {value.lower()}."
+
+
 def process_command(
     text,
     public_key,
@@ -1030,6 +1090,17 @@ def process_command(
             if not _is_superadmin(public_key, conn):
                 return "Superadmin access required."
             return _process_admin_board_command(stripped, public_key, conn)
+        finally:
+            conn.close()
+
+    if upper.startswith("ADMIN NOTIFY"):
+        conn = get_db()
+        try:
+            if not _is_superadmin(public_key, conn):
+                return "Superadmin access required."
+            return _process_admin_notify_command(
+                stripped, public_key, conn
+            )
         finally:
             conn.close()
 
@@ -1122,7 +1193,11 @@ def process_command(
         try:
             if not _is_superadmin(public_key, conn):
                 return "Superadmin access required."
-            return "ADMIN ROLE LIST; GRANT name|sysop; REVOKE name. ADMIN BOARD HELP."
+            return (
+                "ADMIN ROLE LIST; GRANT name|sysop; REVOKE name. "
+                "ADMIN NOTIFY STATUS/MAIL ON|OFF/REGISTRATION ON|OFF; "
+                "ADMIN BOARD HELP."
+            )
         finally:
             conn.close()
 
@@ -1727,6 +1802,9 @@ async def main():
     advert_task = asyncio.create_task(
         scheduled_advertisements()
     )
+    notification_task = asyncio.create_task(
+        email_notifications.run_worker(DB_FILE)
+    )
 
     print()
     print(f"[{stamp()}] NAC-BBS is online.")
@@ -1753,11 +1831,13 @@ async def main():
 
     finally:
         advert_task.cancel()
+        notification_task.cancel()
 
-        try:
-            await advert_task
-        except asyncio.CancelledError:
-            pass
+        for task in (advert_task, notification_task):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
         await meshcore.stop_auto_message_fetching()
         await meshcore.disconnect()
