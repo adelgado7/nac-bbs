@@ -1049,11 +1049,12 @@ def _process_admin_notify_command(text, public_key, conn):
     boards_v1.audit(
         conn,
         public_key,
-        "set_email_notification",
+        "set_notification",
         kind,
         value.lower(),
     )
-    return f"{kind_name} email alerts turned {value.lower()}."
+    label = "chat notifications" if kind_name == "CHAT" else "email alerts"
+    return f"{kind_name} {label} turned {value.lower()}."
 
 
 def process_command(
