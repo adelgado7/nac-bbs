@@ -27,8 +27,8 @@ COURTESY_ADVERT_COOLDOWN_SECONDS = 30 * 60
 COURTESY_ADVERT_DELAY_SECONDS = 1.0
 MESHCORE_CLIENT_TYPE = 1
 
-# Community directory behavior.
-DIR_PAGE_SIZE = 10
+# Community directory replies are kept within the radio payload budget.
+DIR_REPLY_MAX_BYTES = 140
 PLAN_MAX_LENGTH = 120
 
 
@@ -447,11 +447,12 @@ def get_directory_page(page=1):
 
     total = len(rows)
     max_page_number = max(total, 1)
-    header_budget = len(
+    header = (
         "NAC-BBS Mailbox Directory\n"
         f"Page {max_page_number} of {max_page_number} "
         f"- {total} registered"
-    .encode("utf-8"))
+    )
+    header_budget = len(header.encode("utf-8"))
     footer_budget = (
         len(f"Use DIR {max_page_number} for more.".encode("utf-8"))
         if total > 1 else 0
