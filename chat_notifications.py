@@ -85,6 +85,19 @@ def is_enabled(db_file):
         conn.close()
 
 
+def mark_suppressed(db_file, notification_id):
+    conn = sqlite3.connect(db_file)
+    try:
+        with conn:
+            conn.execute("""
+                UPDATE chat_notification_outbox
+                SET status='suppressed', last_error='disabled before delivery'
+                WHERE id=? AND status='pending'
+            """, (notification_id,))
+    finally:
+        conn.close()
+
+
 def mark_sent(db_file, notification_id):
     conn = sqlite3.connect(db_file)
     try:
