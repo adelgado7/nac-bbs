@@ -19,10 +19,16 @@ A superadmin can issue these commands over MeshCore:
 - `ADMIN NOTIFY STATUS`
 - `ADMIN NOTIFY MAIL OFF` or `ADMIN NOTIFY MAIL ON`
 - `ADMIN NOTIFY REGISTRATION OFF` or `ADMIN NOTIFY REGISTRATION ON`
+- `ADMIN NOTIFY CHAT OFF` or `ADMIN NOTIFY CHAT ON`
 
-Both alerts are on by default. Settings are stored in SQLite and take effect
-immediately; no service restart is needed.
+All three alerts are on by default. Settings are stored in SQLite and take
+effect immediately; no service restart is needed. Chat alerts are sent as a
+direct MeshCore message when a user's unread mailbox changes from empty to
+nonempty. Additional mail arriving while unread mail remains does not send
+another chat notice. The notice says to send `NEW`; it contains no mail
+contents. If the recipient cannot be reached, the notice stays queued and is
+retried.
 
 Registration email contains the local date/time and the new BBS display name.
 Mail-arrival email contains the local date/time, sender name, and mailbox item
-number. It does not contain the private BBSMail message text.
+number. Neither email nor chat notices contain the private BBSMail message text.
