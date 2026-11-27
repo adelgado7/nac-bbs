@@ -18,6 +18,7 @@ POLL_SECONDS = 20
 MAX_PER_PASS = 10
 KIND_MAIL = "mail"
 KIND_REGISTRATION = "registration"
+KIND_CHAT = "chat"
 
 
 def ensure_schema(conn):
@@ -55,7 +56,7 @@ def is_enabled(conn, kind):
         "SELECT enabled FROM notification_settings WHERE kind = ?",
         (kind,),
     ).fetchone()
-    # Both notifications start enabled. A superadmin can switch either off.
+    # Alerts start enabled. A superadmin can switch each one off.
     return bool(row["enabled"]) if row else True
 
 
@@ -70,12 +71,32 @@ def set_enabled(conn, kind, enabled, updated_by):
                 updated_at=excluded.updated_at,
                 updated_by=excluded.updated_by
         """, (kind, int(bool(enabled)), now, updated_by))
+        if not enabled:
+            outbox_by_kind = {
+                KIND_MAIL: ("email_notification_outbox", "kind = ?"),
+                KIND_REGISTRATION: ("email_notification_outbox", "kind = ?"),
+                KIND_CHAT: ("chat_notification_outbox", "1 = 1"),
+            }
+            table, condition = outbox_by_kind[kind]
+            params = (kind,) if condition == "kind = ?" else ()
+            table_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()
+            if table_exists:
+                conn.execute(
+                    f"UPDATE {table} SET status='suppressed', "
+                    f"last_error='disabled before delivery' "
+                    f"WHERE status='pending' AND {condition}",
+                    params,
+                )
 
 
 def settings_status(conn):
     return {
         KIND_MAIL: is_enabled(conn, KIND_MAIL),
         KIND_REGISTRATION: is_enabled(conn, KIND_REGISTRATION),
+        KIND_CHAT: is_enabled(conn, KIND_CHAT),
     }
 
 
